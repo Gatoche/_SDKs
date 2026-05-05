@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>Wps.Module</RootNamespace>
+    <AssemblyName>Wps.Module.Sdk</AssemblyName>
+    <Version>2.0.0</Version>
+    <Company>wipiSoft</Company>
+    <Description>SDK côté module : Bootstrap, IPC client, heartbeat reply, configuration Window pour mode embarqué.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Wps.Module.Contracts\Wps.Module.Contracts.csproj" />
+    <ProjectReference Include="..\Wps.Module.Sdk.Core\Wps.Module.Sdk.Core.csproj" />
+  </ItemGroup>
+
+  <!-- WpsDebugSender est exposé par Wps.Module.Sdk.Core (qui l'embarque). Pas besoin de le
+       réinclure ici en source-link, sinon CS0436 (type dupliqué). -->
+
+</Project>

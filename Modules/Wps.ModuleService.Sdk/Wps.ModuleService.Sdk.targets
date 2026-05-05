@@ -1,0 +1,13 @@
+<!--
+  Wps.ModuleService.Sdk.targets — re-export des targets unifiés du Core. La logique
+  (validation nom, injection AssemblyMetadata, auto-deploy post-build) est centralisée
+  dans Wps.Module.Sdk.Core.targets, partagée avec Wps.Module.Sdk.
+
+  Conventions csproj du ModuleService :
+    <WipiModuleKind>ModuleService</WipiModuleKind>
+    <WipiModuleName>Demo5.Echo</WipiModuleName>
+    <WipiModuleVersion>1.0</WipiModuleVersion>
+-->
+<Project>
+  <Import Project="..\Wps.Module.Sdk.Core\Wps.Module.Sdk.Core.targets" />
+</Project>

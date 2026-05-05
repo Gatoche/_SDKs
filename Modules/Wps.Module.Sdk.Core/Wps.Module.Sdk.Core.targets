@@ -1,0 +1,131 @@
+<!--
+  Wps.Module.Sdk.Core.targets — targets MSBuild unifiés pour les apps wipiSoft (Module ET ModuleService).
+  Importé indirectement via Wps.Module.Sdk.targets ou Wps.ModuleService.Sdk.targets selon le type
+  de l'app. Évite la duplication entre les deux SDK.
+
+  Conventions csproj de l'app (Module ou ModuleService) :
+
+    <WipiModuleKind>Module</WipiModuleKind>            (ou ModuleService)
+    <WipiModuleName>Demo</WipiModuleName>              (nom court CLI / scan, sans espaces
+                                                        ni caractères Windows interdits)
+    <WipiModuleVersion>1.0</WipiModuleVersion>         (version applicative, distincte du wire-protocol)
+
+  Override possible :
+    <WipiModulesDeployDir>D:\Custom\Modules</WipiModulesDeployDir>
+
+  Ce que ce targets fait :
+    1. Valide WipiModuleName (pas d'espaces, pas de chars Windows interdits)
+    2. Valide WipiModuleKind ∈ { Module, ModuleService }
+    3. Injecte AssemblyMetadata dans le PE (WipiModuleName, WipiModuleVersion, WipiModuleKind)
+       → relus runtime par WpsModuleMetadata pour la Discovery côté Host
+    4. Auto-deploy post-build vers C:\_wipiSoft\Apps\Modules\<WipiModuleName>\
+       (un sous-dossier par app, peu importe le Kind — le Host les distingue via metadata PE)
+
+  Rétrocompat : <WipiModule>true</WipiModule> (ancienne convention, tous des Modules) reste
+  acceptée. Si les deux sont définis, <WipiModuleKind> gagne.
+-->
+<Project>
+
+  <PropertyGroup>
+    <!-- Rétrocompat : <WipiModule>true</WipiModule> = ancien marqueur pour les Modules. -->
+    <WipiModuleKind Condition="'$(WipiModuleKind)' == '' and '$(WipiModule)' == 'true'">Module</WipiModuleKind>
+
+    <!-- Dossier racine où les apps wipiSoft sont déployées (1 sous-dossier par app) -->
+    <WipiModulesDeployDir Condition="'$(WipiModulesDeployDir)' == ''">C:\_wipiSoft\Apps\Modules</WipiModulesDeployDir>
+
+    <!-- Nom court de l'app (default = nom du projet, override via <WipiModuleName>) -->
+    <WipiModuleName Condition="'$(WipiModuleName)' == ''">$(MSBuildProjectName)</WipiModuleName>
+
+    <!-- Chemin de déploiement final pour CETTE app -->
+    <WipiModuleDeployPath>$(WipiModulesDeployDir)\$(WipiModuleName)</WipiModuleDeployPath>
+  </PropertyGroup>
+
+  <!--
+    Injection des conventions wipiSoft dans le PE (AssemblyMetadata) → lecture runtime via
+    reflection (cf. WpsModuleMetadata). Permet à WpsModuleDiscovery de retrouver l'identité
+    authentique (nom, version, kind) même si le dossier de déploiement a été renommé.
+  -->
+  <ItemGroup Condition="'$(WipiModuleKind)' != ''">
+    <AssemblyMetadata Include="WipiModuleName" Value="$(WipiModuleName)" />
+    <AssemblyMetadata Include="WipiModuleVersion" Value="$(WipiModuleVersion)" />
+    <AssemblyMetadata Include="WipiModuleKind" Value="$(WipiModuleKind)" />
+  </ItemGroup>
+
+  <!--
+    LGO (Logiciel de Gestion d'Officine) — metadata informationnelle indiquant le ou les
+    LGO compatibles avec l'app. Format : valeurs séparées par ';' (standard MSBuild).
+    Exemples :
+      <LGO>Winpharma</LGO>            (1 valeur)
+      <LGO>Winpharma;LGPI;Pharma</LGO> (plusieurs)
+    Optionnel — pas injecté si <LGO> n'est pas défini par le csproj de l'app.
+  -->
+  <ItemGroup Condition="'$(WipiModuleKind)' != '' and '$(LGO)' != ''">
+    <AssemblyMetadata Include="WipiLGO" Value="$(LGO)" />
+  </ItemGroup>
+
+  <!--
+    Validation : le WipiModuleKind doit être Module ou ModuleService.
+  -->
+  <Target Name="WpsValidateModuleKind"
+          BeforeTargets="Build"
+          Condition="'$(WipiModuleKind)' != ''">
+
+    <Error Condition="'$(WipiModuleKind)' != 'Module' and '$(WipiModuleKind)' != 'ModuleService'"
+           Text="WipiModuleKind='$(WipiModuleKind)' invalide — attendu : 'Module' ou 'ModuleService'." />
+  </Target>
+
+  <!--
+    Validation : le WipiModuleName est utilisé en argument CLI ET comme nom de dossier
+    de déploiement. Donc ni espaces ni caractères Windows interdits. Échoue le build sinon.
+  -->
+  <Target Name="WpsValidateModuleName"
+          BeforeTargets="Build"
+          Condition="'$(WipiModuleKind)' != ''">
+
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains(' '))"
+           Text="WipiModuleName='$(WipiModuleName)' ne doit pas contenir d'espace (utilisé en CLI --show et comme nom de dossier de déploiement). Utilise un identifiant compact, ex: 'OuiPDF', 'MailToolsMini'." />
+
+    <!-- Caractères interdits pour un nom de dossier Windows : \ / : * ? " < > | -->
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains('\'))"
+           Text="WipiModuleName='$(WipiModuleName)' contient un caractère interdit (\)." />
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains('/'))"
+           Text="WipiModuleName='$(WipiModuleName)' contient un caractère interdit (/)." />
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains(':'))"
+           Text="WipiModuleName='$(WipiModuleName)' contient un caractère interdit (:)." />
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains('*'))"
+           Text="WipiModuleName='$(WipiModuleName)' contient un caractère interdit (*)." />
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains('?'))"
+           Text="WipiModuleName='$(WipiModuleName)' contient un caractère interdit (?)." />
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains('&quot;'))"
+           Text="WipiModuleName='$(WipiModuleName)' contient un caractère interdit (&quot;)." />
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains('&lt;'))"
+           Text="WipiModuleName='$(WipiModuleName)' contient un caractère interdit (&lt;)." />
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains('&gt;'))"
+           Text="WipiModuleName='$(WipiModuleName)' contient un caractère interdit (&gt;)." />
+    <Error Condition="$([System.String]::Copy('$(WipiModuleName)').Contains('|'))"
+           Text="WipiModuleName='$(WipiModuleName)' contient un caractère interdit (|)." />
+  </Target>
+
+  <!--
+    Cible : copie tout le TargetDir (exe + dll + runtimes/ + deps.json) vers le dossier
+    de déploiement de l'app. Active uniquement si <WipiModuleKind> est défini.
+    SkipUnchangedFiles=true → rebuilds incrémentaux rapides.
+  -->
+  <Target Name="WpsDeployApp"
+          AfterTargets="Build"
+          Condition="'$(WipiModuleKind)' != ''">
+
+    <Message Importance="high"
+             Text="Wps.$(WipiModuleKind).Sdk: deploying '$(WipiModuleName)' (v$(WipiModuleVersion)) → $(WipiModuleDeployPath)" />
+
+    <ItemGroup>
+      <_WpsDeployFiles Include="$(TargetDir)**\*.*" />
+    </ItemGroup>
+
+    <Copy SourceFiles="@(_WpsDeployFiles)"
+          DestinationFiles="@(_WpsDeployFiles->'$(WipiModuleDeployPath)\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          OverwriteReadOnlyFiles="true" />
+  </Target>
+
+</Project>

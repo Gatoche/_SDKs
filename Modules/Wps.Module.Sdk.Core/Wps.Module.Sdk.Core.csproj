@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Wps.Module.Core</RootNamespace>
+    <AssemblyName>Wps.Module.Sdk.Core</AssemblyName>
+    <Version>2.0.0</Version>
+    <Company>wipiSoft</Company>
+    <Description>SDK noyau partagé entre Wps.Module.Sdk (côté module), Wps.Host.Sdk (côté host orchestrateur) et Wps.ModuleService.Sdk (côté ModuleService headless). Bas-niveau IPC neutre (pipes duplex, transport ligne par ligne) et helpers de validation contract version. Ne dépend pas de WPF.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Logging UDP broadcast vers wipiLOG (port 9876) — fire-and-forget, ne crashe jamais.
+         WpsDebugSender reste dans _libs (utilisé aussi par toutes les autres apps wipiSoft, pas
+         seulement les modules). Chemin : depuis _SDKs/Modules/Wps.Module.Sdk.Core/, on remonte
+         3 niveaux pour atteindre dev/, puis _libs/. -->
+    <Compile Include="..\..\..\_libs\WpsDebugSender.cs" Link="WpsDebugSender.cs" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,66 @@
+<UserControl x:Class="Wps.Module.Hosting.Ui.WpsTitleBar"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Name="Root"
+             Background="#22272E"
+             BorderBrush="#3F3F46"
+             BorderThickness="0,0,0,1"
+             Height="36">
+    <UserControl.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="pack://application:,,,/Wps.Host.Sdk;component/Resources/SharedStyles.xaml" />
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </UserControl.Resources>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <!-- Zone gauche : icône + titre. Tout le reste de la zone (jusqu'aux boutons à
+                 droite) est draggable via WindowChrome.CaptionHeight. -->
+            <ColumnDefinition Width="*" />
+            <!-- Boutons système collés à droite. WindowChrome.IsHitTestVisibleInChrome="True"
+                 sur le panel parent pour que les clics ne soient pas avalés par la zone drag. -->
+            <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+
+        <StackPanel Grid.Column="0" Orientation="Horizontal"
+                    VerticalAlignment="Center" Margin="12,0,0,0">
+            <Image Source="{Binding Path=Icon, RelativeSource={RelativeSource AncestorType=Window}}"
+                   Width="16" Height="16"
+                   RenderOptions.BitmapScalingMode="HighQuality" />
+            <TextBlock Text="{Binding Path=Title, RelativeSource={RelativeSource AncestorType=Window}}"
+                       FontSize="12"
+                       VerticalAlignment="Center" Margin="8,0,0,0">
+                <TextBlock.Style>
+                    <!-- Foreground bascule sur la propriété IsHostActive du UserControl
+                         (mise à jour par le host depuis son focus polling). Permet au host
+                         de garder le titre "actif" quand le focus est sur un module embedded
+                         (Windows.IsActive serait alors false sur la Window Host alors que pour
+                         l'utilisateur l'app reste active). -->
+                    <Style TargetType="TextBlock">
+                        <Setter Property="Foreground" Value="#D0D6DE" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding ElementName=Root, Path=IsHostActive}" Value="False">
+                                <Setter Property="Foreground" Value="#7A828A" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </TextBlock.Style>
+            </TextBlock>
+        </StackPanel>
+
+        <StackPanel Grid.Column="1" Orientation="Horizontal"
+                    WindowChrome.IsHitTestVisibleInChrome="True">
+            <Button x:Name="MinBtn" Style="{StaticResource WpsTitleBarBtn}"
+                    Content="&#xE921;" Click="OnMinimize"
+                    ToolTip="Réduire" />
+            <Button x:Name="MaxRestoreBtn" Style="{StaticResource WpsTitleBarBtn}"
+                    Content="&#xE922;" Click="OnMaxRestore"
+                    ToolTip="Agrandir" />
+            <Button x:Name="CloseBtn" Style="{StaticResource WpsTitleBarCloseBtn}"
+                    Content="&#xE8BB;" Click="OnClose"
+                    ToolTip="Fermer" />
+        </StackPanel>
+    </Grid>
+</UserControl>

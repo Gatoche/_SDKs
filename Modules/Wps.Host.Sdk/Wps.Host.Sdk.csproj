@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>Wps.Module.Hosting</RootNamespace>
+    <AssemblyName>Wps.Host.Sdk</AssemblyName>
+    <Version>2.0.0</Version>
+    <Company>wipiSoft</Company>
+    <Description>SDK côté host : WpsModuleSlot (launch + handshake + embed + kill), IPC server, heartbeat monitor, lancement détaché via WMI.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Wps.Module.Contracts\Wps.Module.Contracts.csproj" />
+    <ProjectReference Include="..\Wps.Module.Sdk.Core\Wps.Module.Sdk.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- WMI Win32_Process.Create pour lancer les modules détachés du Host (ParentPID = WmiPrvSE.exe) -->
+    <PackageReference Include="System.Management" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- WpsDebugSender est exposé par Wps.Module.Sdk.Core (référencé). Pas de Compile Include
+         ici, sinon CS0436 (type dupliqué dans deux assemblies). -->
+    <!-- Lecture metadata module (PE + Description.md) utilisée par WpsModuleDiscovery.
+         WpsModuleMetadata reste dans _libs (utilisé aussi par wipiManager.DevAll pour lister
+         les props des apps wipiSoft, hors contexte Module/Host). -->
+    <Compile Include="..\..\..\_libs\WpsModuleMetadata.cs" Link="WpsModuleMetadata.cs" />
+  </ItemGroup>
+
+</Project>
