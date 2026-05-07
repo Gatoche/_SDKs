@@ -110,6 +110,11 @@
     Cible : copie tout le TargetDir (exe + dll + runtimes/ + deps.json) vers le dossier
     de déploiement de l'app. Active uniquement si <WipiModuleKind> est défini.
     SkipUnchangedFiles=true → rebuilds incrémentaux rapides.
+
+    Exclusion .pdb en Release : les symboles de debug ne sont pas requis au
+    runtime et alourdissent inutilement les déploiements en prod (notamment
+    chez les confrères via push réseau). En Debug ils sont conservés pour
+    permettre stack traces lisibles + debug attaché.
   -->
   <Target Name="WpsDeployApp"
           AfterTargets="Build"
@@ -118,7 +123,10 @@
     <Message Importance="high"
              Text="Wps.$(WipiModuleKind).Sdk: deploying '$(WipiModuleName)' (v$(WipiModuleVersion)) → $(WipiModuleDeployPath)" />
 
-    <ItemGroup>
+    <ItemGroup Condition="'$(Configuration)' == 'Release'">
+      <_WpsDeployFiles Include="$(TargetDir)**\*.*" Exclude="$(TargetDir)**\*.pdb" />
+    </ItemGroup>
+    <ItemGroup Condition="'$(Configuration)' != 'Release'">
       <_WpsDeployFiles Include="$(TargetDir)**\*.*" />
     </ItemGroup>
 
@@ -126,6 +134,20 @@
           DestinationFiles="@(_WpsDeployFiles->'$(WipiModuleDeployPath)\%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true"
           OverwriteReadOnlyFiles="true" />
+  </Target>
+
+  <!--
+    Cible : génère le manifest d'intégrité du déploiement (manifest.json + master guid)
+    après que WpsDeployApp ait copié les fichiers. Le host vérifie ces fichiers via
+    WpsDeployVerifier avant de lancer le module — refuse de lancer si manifest invalide
+    ou fichier corrompu, plutôt que laisser un dialogue runtime cryptique apparaître.
+  -->
+  <Target Name="WpsGenerateDeployManifest"
+          AfterTargets="WpsDeployApp"
+          Condition="'$(WipiModuleKind)' != ''">
+
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)WpsGenerateManifest.ps1&quot; -DeployDir &quot;$(WipiModuleDeployPath)&quot; -AppName &quot;$(WipiModuleName)&quot; -Kind &quot;$(WipiModuleKind)&quot; -Version &quot;$(WipiModuleVersion)&quot;"
+          ConsoleToMSBuild="true" />
   </Target>
 
 </Project>

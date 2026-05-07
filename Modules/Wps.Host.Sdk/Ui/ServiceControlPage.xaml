@@ -76,16 +76,35 @@
                 </StackPanel>
             </StackPanel>
 
-            <!-- ====== Statut Running/Stopped ====== -->
+            <!-- ====== Statut Running/Stopped (+ zone d'erreur déploiement) ====== -->
             <Border Grid.Row="1" Background="#22272E" CornerRadius="6" Padding="14"
                     Margin="0,0,0,12">
-                <StackPanel Orientation="Horizontal">
-                    <Ellipse x:Name="StatusDot" Width="10" Height="10"
-                             VerticalAlignment="Center" Margin="0,0,10,0"
-                             Fill="#80909A" />
-                    <TextBlock x:Name="StatusText" Text="Arrêté"
-                               Foreground="#D0D6DE" FontSize="14" VerticalAlignment="Center" />
-                </StackPanel>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <!-- Statut classique : pastille + texte ("En fonctionnement", "Arrêté", etc.) -->
+                    <StackPanel Grid.Column="0" Orientation="Horizontal">
+                        <Ellipse x:Name="StatusDot" Width="10" Height="10"
+                                 VerticalAlignment="Center" Margin="0,0,10,0"
+                                 Fill="#80909A" />
+                        <TextBlock x:Name="StatusText" Text="Arrêté"
+                                   Foreground="#D0D6DE" FontSize="14" VerticalAlignment="Center" />
+                    </StackPanel>
+
+                    <!-- Zone d'erreur de déploiement : à droite, masquée par défaut. Affichée
+                         en rouge quand WpsDeployVerifier détecte un déploiement invalide
+                         (manifest absent, fichier manquant, fichier corrompu...). Évite que
+                         l'utilisateur tombe sur des dialogues runtime cryptiques. -->
+                    <TextBlock x:Name="DeployErrorText" Grid.Column="1"
+                               Foreground="#E14D4D" FontSize="13"
+                               VerticalAlignment="Center" HorizontalAlignment="Right"
+                               TextTrimming="CharacterEllipsis"
+                               Margin="16,0,0,0"
+                               Visibility="Collapsed" />
+                </Grid>
             </Border>
 
             <!-- ====== Toggle Daemon (switch style partagé) ====== -->

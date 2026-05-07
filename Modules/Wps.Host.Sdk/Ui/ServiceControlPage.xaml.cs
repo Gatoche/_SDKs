@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Threading;
+using Wps.Module.Core;
 
 namespace Wps.Module.Hosting.Ui;
 
@@ -113,11 +114,40 @@ public partial class ServiceControlPage : UserControl
         try
         {
             await client.LaunchAsync(_service.ExePath);
+            // Lancement OK → on efface une éventuelle erreur de déploiement précédente.
+            SetDeployError(null);
+        }
+        catch (WpsDeployInvalidException ex)
+        {
+            // Le déploiement n'a pas passé la vérification d'intégrité. On annule le
+            // launch côté client (sinon il reste dans un état "OnDemand actif sans process")
+            // et on affiche le message d'erreur dans la zone dédiée à droite du statut.
+            _client = null;
+            _ownsClient = false;
+            SetDeployError(ex.Result.DisplayMessage);
+            WpsDebugSender.Log($"ServiceControlPage [{_service.Name}]: deploy invalid → {ex.Result.DisplayMessage}",
+                LogLevel.Error, LogTag);
         }
         catch (Exception ex)
         {
             WpsDebugSender.Log($"ServiceControlPage [{_service.Name}]: launch failed {ex.GetType().Name}: {ex.Message}",
                 LogLevel.Error, LogTag);
+        }
+    }
+
+    /// <summary>Pilote l'affichage de la zone d'erreur de déploiement (à droite du statut).
+    /// Passer <c>null</c> ou chaîne vide pour masquer.</summary>
+    private void SetDeployError(string? message)
+    {
+        if (string.IsNullOrEmpty(message))
+        {
+            DeployErrorText.Text = "";
+            DeployErrorText.Visibility = Visibility.Collapsed;
+        }
+        else
+        {
+            DeployErrorText.Text = $"🟥 Deploy invalide : {message}";
+            DeployErrorText.Visibility = Visibility.Visible;
         }
     }
 

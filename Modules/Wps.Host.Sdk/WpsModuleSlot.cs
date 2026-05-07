@@ -72,6 +72,19 @@ public sealed class WpsModuleSlot : IDisposable
         if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
             throw new FileNotFoundException("Module exe not found", exePath);
 
+        // Vérification d'intégrité du déploiement avant tout lancement
+        // (cf. WpsModuleServiceClient.LaunchAsync pour la motivation détaillée).
+        var deployDir = Path.GetDirectoryName(exePath) ?? Environment.CurrentDirectory;
+        var appName = Path.GetFileNameWithoutExtension(exePath);
+        var verify = WpsDeployVerifier.Verify(deployDir, appName);
+        if (!verify.IsValid)
+        {
+            WpsDebugSender.Log(
+                $"LaunchAsync: deploy invalid for '{appName}' → {verify.DisplayMessage}",
+                LogLevel.Error, LogTag);
+            throw new WpsDeployInvalidException(verify);
+        }
+
         ModulePath = exePath;
         _sessionId = Guid.NewGuid().ToString("N");
         var sidShort = _sessionId[..8];

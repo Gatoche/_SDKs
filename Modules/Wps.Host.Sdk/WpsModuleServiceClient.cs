@@ -78,6 +78,22 @@ public sealed class WpsModuleServiceClient : IDisposable
         if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
             throw new FileNotFoundException("ModuleService exe not found", exePath);
 
+        // Vérification d'intégrité du déploiement avant tout lancement : manifest présent,
+        // master guid OK, tous les fichiers listés présents avec le bon hash. En cas
+        // d'échec, on lève WpsDeployInvalidException — le caller (UI pageslot) catche et
+        // affiche l'erreur en zone dédiée, sans laisser apparaître un dialogue runtime
+        // cryptique pour un fichier manquant suite à un push interrompu, etc.
+        var deployDir = Path.GetDirectoryName(exePath) ?? Environment.CurrentDirectory;
+        var appName = Path.GetFileNameWithoutExtension(exePath);
+        var verify = WpsDeployVerifier.Verify(deployDir, appName);
+        if (!verify.IsValid)
+        {
+            WpsDebugSender.Log(
+                $"LaunchAsync: deploy invalid for '{appName}' → {verify.DisplayMessage}",
+                LogLevel.Error, LogTag);
+            throw new WpsDeployInvalidException(verify);
+        }
+
         ServicePath = exePath;
         _sessionId = Guid.NewGuid().ToString("N");
         var sidShort = _sessionId[..8];
