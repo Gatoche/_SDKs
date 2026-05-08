@@ -12,11 +12,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Logging UDP broadcast vers wipiLOG (port 9876) — fire-and-forget, ne crashe jamais.
-         WpsDebugSender reste dans _libs (utilisé aussi par toutes les autres apps wipiSoft, pas
-         seulement les modules). Chemin : depuis _SDKs/Modules/Wps.Module.Sdk.Core/, on remonte
-         3 niveaux pour atteindre dev/, puis _libs/. -->
+    <!-- Helpers source-linkés depuis _libs/ (utilisés par Wps.Module.Sdk.Core ET
+         Wps.StandaloneApp.Sdk → meilleur emplacement de partage). Chemin :
+         depuis _SDKs/Modules/Wps.Module.Sdk.Core/, on remonte 3 niveaux pour atteindre dev/. -->
     <Compile Include="..\..\..\_libs\WpsDebugSender.cs" Link="WpsDebugSender.cs" />
+    <!-- Vérification d'intégrité du déploiement (manifest + master guid). -->
+    <Compile Include="..\..\..\_libs\WpsDeployVerifier.cs" Link="WpsDeployVerifier.cs" />
   </ItemGroup>
 
 </Project>

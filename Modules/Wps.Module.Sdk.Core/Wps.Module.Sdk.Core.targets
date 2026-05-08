@@ -146,7 +146,9 @@
           AfterTargets="WpsDeployApp"
           Condition="'$(WipiModuleKind)' != ''">
 
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)WpsGenerateManifest.ps1&quot; -DeployDir &quot;$(WipiModuleDeployPath)&quot; -AppName &quot;$(WipiModuleName)&quot; -Kind &quot;$(WipiModuleKind)&quot; -Version &quot;$(WipiModuleVersion)&quot;"
+    <!-- Le script PS1 vit dans _libs (partagé avec Wps.StandaloneApp.Sdk).
+         Depuis _SDKs/Modules/Wps.Module.Sdk.Core/, on remonte 3 niveaux jusqu'à dev/. -->
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)..\..\..\_libs\WpsGenerateManifest.ps1&quot; -DeployDir &quot;$(WipiModuleDeployPath)&quot; -AppName &quot;$(WipiModuleName)&quot; -Kind &quot;$(WipiModuleKind)&quot; -Version &quot;$(WipiModuleVersion)&quot;"
           ConsoleToMSBuild="true" />
   </Target>
 

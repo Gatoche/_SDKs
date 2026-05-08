@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RootNamespace>Wps.AppLauncher</RootNamespace>
+    <AssemblyName>Wps.AppLauncher</AssemblyName>
+    <Version>1.0.0</Version>
+    <Company>wipiSoft</Company>
+    <Description>Launcher natif (NativeAOT) pour les apps wipiSoft standalone. Vérifie l'intégrité du déploiement et délègue au vrai AppHost.</Description>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- NativeAOT : binaire natif autonome, pas besoin du runtime .NET sur la machine cible. -->
+    <PublishAot>true</PublishAot>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+
+    <!-- Réduction de taille du binaire publié. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <StripSymbols>true</StripSymbols>
+    <IlcOptimizationPreference>Size</IlcOptimizationPreference>
+
+    <!-- Pas d'usage de WinForms : on appelle MessageBox via P/Invoke User32 → AOT-friendly. -->
+
+    <!-- Workaround Windows on ARM : si la machine de dev est ARM64 mais qu'on utilise
+         dotnet x64 pour publier en win-x64, le NETCore.Native.Publish.targets detecte
+         un host arm64 et exige le pkg ILCompiler arm64 (declare ci-dessous). On force
+         _hostArchitecture=x64 pour que le link.exe x64 soit utilise. Sur une vraie
+         machine x64, cette propriete est deja x64 par defaut → no-op. -->
+    <_hostArchitecture>x64</_hostArchitecture>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Helpers source-linkés depuis _libs/ (zéro duplication avec les autres SDK).
+         Depuis _SDKs/Apps/Wps.AppLauncher/, on remonte 3 niveaux jusqu'à dev/. -->
+    <Compile Include="..\..\..\_libs\WpsDebugSender.cs" Link="WpsDebugSender.cs" />
+    <Compile Include="..\..\..\_libs\WpsDeployVerifier.cs" Link="WpsDeployVerifier.cs" />
+  </ItemGroup>
+
+  <!-- Cross-compilation : la machine de dev étant ARM64 alors que le launcher cible
+       win-x64, il faut référencer explicitement l'ILCompiler ARM64 → x64.
+       On référence inconditionnellement (no-op sur une vraie machine x64). -->
+  <ItemGroup>
+    <PackageReference Include="runtime.win-arm64.Microsoft.DotNet.ILCompiler" Version="8.0.13" />
+  </ItemGroup>
+
+</Project>

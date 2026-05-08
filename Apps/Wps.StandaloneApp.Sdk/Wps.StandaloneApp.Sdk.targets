@@ -1,0 +1,150 @@
+<!--
+  Wps.StandaloneApp.Sdk.targets — targets MSBuild pour les apps wipiSoft standalone.
+
+  Conventions csproj de l'app standalone :
+
+    <WipiAppKind>Standalone</WipiAppKind>      (réservé — futur : "Standalone" | autre)
+    <WipiAppName>OuiPDF</WipiAppName>          (nom court, sans espace ni / \ : * ? " < > |)
+    <WipiAppVersion>0.6.1</WipiAppVersion>     (version applicative)
+
+  Override possible :
+    <WipiSkipLauncher>true</WipiSkipLauncher>   (skip de la transformation : utile en debug)
+
+  Ce que ce targets fait, après Build :
+
+    1. Valide WipiAppName (mêmes règles que WipiModuleName)
+    2. Renomme  $(TargetDir)\<AppName>.exe → <AppName>.app.exe   (le vrai AppHost .NET)
+    3. Copie    $(LauncherSrc)              → <AppName>.exe       (le launcher AOT)
+    4. Injecte  l'icône <ApplicationIcon> de l'app dans le launcher copié (rcedit)
+    5. Génère   <AppName>.deploy.manifest.json + <AppName>.deploy.guid (intégrité)
+
+  Le launcher copié vérifie le manifest au démarrage (WpsDeployVerifier.Verify), et :
+    - Si OK  : transmet ses args à l'instance existante via le pipe canonique
+               wipiSoft.<AppName>.Pipe (si une instance tourne, détectée via mutex
+               wipiSoft.<AppName>.SingleInstance), sinon spawn <AppName>.app.exe.
+    - Si KO  : MessageBox propre + log wipiLOG + exit 1.
+
+  Convention IPC (à respecter côté app) :
+    - Mutex single-instance : "wipiSoft." + WipiAppName + ".SingleInstance"
+    - Named pipe IPC        : "wipiSoft." + WipiAppName + ".Pipe"
+    - Protocole pipe        : 1 ligne par argument, lu jusqu'à EOF du stream.
+-->
+<Project>
+
+  <PropertyGroup>
+    <WipiAppName Condition="'$(WipiAppName)' == ''">$(MSBuildProjectName)</WipiAppName>
+
+    <!-- Source du launcher AOT pré-publié (compilé une seule fois dans le SDK). -->
+    <WpsLauncherSrc Condition="'$(WpsLauncherSrc)' == ''">$(MSBuildThisFileDirectory)..\Wps.AppLauncher\published\win-x64\Wps.AppLauncher.exe</WpsLauncherSrc>
+
+    <!-- rcedit-x64.exe pour l'injection d'icône (et plus tard : version info). -->
+    <WpsRceditPath Condition="'$(WpsRceditPath)' == ''">$(MSBuildThisFileDirectory)..\..\..\_tools\rcedit-x64.exe</WpsRceditPath>
+
+    <!-- WpsGenerateManifest.ps1 (partagé avec Wps.Module.Sdk.Core, vit dans _libs). -->
+    <WpsManifestScript Condition="'$(WpsManifestScript)' == ''">$(MSBuildThisFileDirectory)..\..\..\_libs\WpsGenerateManifest.ps1</WpsManifestScript>
+  </PropertyGroup>
+
+  <!-- Injection metadata wipiSoft dans le PE de l'app (l'AppHost réel après rename).
+       Permet à un éventuel inventaire (wipiManager) de retrouver l'identité authentique. -->
+  <ItemGroup Condition="'$(WipiAppKind)' != ''">
+    <AssemblyMetadata Include="WipiAppName" Value="$(WipiAppName)" />
+    <AssemblyMetadata Include="WipiAppVersion" Value="$(WipiAppVersion)" />
+    <AssemblyMetadata Include="WipiAppKind" Value="$(WipiAppKind)" />
+  </ItemGroup>
+
+  <!-- Validation : WipiAppName ne doit pas contenir d'espace ni de char Windows interdit. -->
+  <Target Name="WpsValidateAppName"
+          BeforeTargets="Build"
+          Condition="'$(WipiAppKind)' != '' and '$(WipiSkipLauncher)' != 'true'">
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains(' '))"
+           Text="WipiAppName='$(WipiAppName)' ne doit pas contenir d'espace." />
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains('\'))"
+           Text="WipiAppName='$(WipiAppName)' contient un caractère interdit (\)." />
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains('/'))"
+           Text="WipiAppName='$(WipiAppName)' contient un caractère interdit (/)." />
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains(':'))"
+           Text="WipiAppName='$(WipiAppName)' contient un caractère interdit (:)." />
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains('*'))"
+           Text="WipiAppName='$(WipiAppName)' contient un caractère interdit (*)." />
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains('?'))"
+           Text="WipiAppName='$(WipiAppName)' contient un caractère interdit (?)." />
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains('&quot;'))"
+           Text="WipiAppName='$(WipiAppName)' contient un caractère interdit (&quot;)." />
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains('&lt;'))"
+           Text="WipiAppName='$(WipiAppName)' contient un caractère interdit (&lt;)." />
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains('&gt;'))"
+           Text="WipiAppName='$(WipiAppName)' contient un caractère interdit (&gt;)." />
+    <Error Condition="$([System.String]::Copy('$(WipiAppName)').Contains('|'))"
+           Text="WipiAppName='$(WipiAppName)' contient un caractère interdit (|)." />
+  </Target>
+
+  <!--
+    Cible : transformation post-build "AppHost → launcher".
+
+    Idempotence : la source de l'AppHost est $(IntermediateOutputPath)apphost.exe
+    (dans obj/, généré par MSBuild et inchangé entre builds incrémentaux). On NE
+    déplace JAMAIS le <App>.exe du TargetDir (qui peut être le launcher de la run
+    précédente) — on copie l'AppHost depuis obj/ et on écrase le <App>.exe par le
+    launcher. La transformation est donc reproductible à l'identique quel que soit
+    l'état du TargetDir au moment de la run.
+
+    Étapes :
+      1. Copy  $(IntermediateOutputPath)apphost.exe  → <TargetDir>\<AppName>.app.exe
+      2. Copy  $(WpsLauncherSrc)                     → <TargetDir>\<AppName>.exe
+      3. rcedit : injection de l'icône <ApplicationIcon> dans le launcher copié
+  -->
+  <Target Name="WpsTransformAppLauncher"
+          AfterTargets="Build"
+          Condition="'$(WipiAppKind)' != '' and '$(WipiSkipLauncher)' != 'true'">
+
+    <Message Importance="high"
+             Text="Wps.StandaloneApp.Sdk: transforming '$(WipiAppName)' (v$(WipiAppVersion)) → launcher AOT devant $(WipiAppName).app.exe" />
+
+    <Error Condition="!Exists('$(WpsLauncherSrc)')"
+           Text="Wps.AppLauncher.exe introuvable à '$(WpsLauncherSrc)'. Publie le launcher au préalable :&#xA;  cd _SDKs\Apps\Wps.AppLauncher&#xA;  dotnet publish -c Release -r win-x64 -o published\win-x64" />
+
+    <PropertyGroup>
+      <_WpsTargetExe>$(TargetDir)$(WipiAppName).exe</_WpsTargetExe>
+      <_WpsTargetAppExe>$(TargetDir)$(WipiAppName).app.exe</_WpsTargetAppExe>
+      <!-- AppHost original généré par MSBuild dans obj/. Ce fichier est la source de
+           vérité : on l'utilise pour produire <AppName>.app.exe, ce qui rend la target
+           idempotente même si <App>.exe du TargetDir est déjà le launcher. -->
+      <_WpsAppHostSrc>$(IntermediateOutputPath)apphost.exe</_WpsAppHostSrc>
+    </PropertyGroup>
+
+    <Error Condition="!Exists('$(_WpsAppHostSrc)')"
+           Text="AppHost intermédiaire introuvable à '$(_WpsAppHostSrc)'. La target attend que MSBuild ait généré apphost.exe avant le post-build (case standard pour OutputType=WinExe/Exe sur .NET 8)." />
+
+    <!-- 1. Copy AppHost (obj/) → <App>.app.exe (toujours frais depuis obj/) -->
+    <Copy SourceFiles="$(_WpsAppHostSrc)"
+          DestinationFiles="$(_WpsTargetAppExe)"
+          OverwriteReadOnlyFiles="true" />
+
+    <!-- 2. Copy launcher AOT → <App>.exe (écrase l'AppHost que _CopyToOutputDirectory y a mis) -->
+    <Copy SourceFiles="$(WpsLauncherSrc)"
+          DestinationFiles="$(_WpsTargetExe)"
+          OverwriteReadOnlyFiles="true" />
+
+    <!-- 3. Injection de l'icône (best-effort : skip si rcedit ou icône absents) -->
+    <PropertyGroup>
+      <_WpsAppIconFull>$(MSBuildProjectDirectory)\$(ApplicationIcon)</_WpsAppIconFull>
+    </PropertyGroup>
+    <Exec Command="&quot;$(WpsRceditPath)&quot; &quot;$(_WpsTargetExe)&quot; --set-icon &quot;$(_WpsAppIconFull)&quot;"
+          Condition="'$(ApplicationIcon)' != '' and Exists('$(WpsRceditPath)') and Exists('$(_WpsAppIconFull)')"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true" />
+  </Target>
+
+  <!--
+    Cible : génère le manifest d'intégrité du déploiement APRÈS la transformation
+    (le launcher renommé et l'AppHost renommé doivent être présents au moment du checksum).
+  -->
+  <Target Name="WpsGenerateStandaloneManifest"
+          AfterTargets="WpsTransformAppLauncher"
+          Condition="'$(WipiAppKind)' != '' and '$(WipiSkipLauncher)' != 'true'">
+
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(WpsManifestScript)&quot; -DeployDir &quot;$(TargetDir.TrimEnd('\'))&quot; -AppName &quot;$(WipiAppName)&quot; -Kind &quot;$(WipiAppKind)&quot; -Version &quot;$(WipiAppVersion)&quot;"
+          ConsoleToMSBuild="true" />
+  </Target>
+
+</Project>

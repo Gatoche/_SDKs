@@ -1,0 +1,5 @@
+# Le binaire launcher AOT publié est commité (utilisé tel quel par
+# Wps.StandaloneApp.Sdk → la chaîne de build des apps standalone n'a
+# pas à republier le launcher). Mais le PDB (~14 Mo) est exclu — il
+# n'est utile que pour debugger le launcher lui-même.
+published/**/*.pdb
