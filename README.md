@@ -10,9 +10,9 @@ Repo GitHub : <https://github.com/Gatoche/_SDKs>
 
 | `_libs/` (sibling) | `_SDKs/` |
 |---|---|
-| Helpers `.cs` standalone, source-linkés via `<Compile Include>` | SDKs structurés, référencés via `<ProjectReference>` |
+| Helpers `.cs` standalone, source-linkés via `<Compile Include>` | SDKs structurés, référencés via `<ProjectReference>` ou via `<Import>` de `.targets` |
 | Pas de dépendance NuGet "encapsulée" — l'assembly du consommateur hérite des deps | Dépendances NuGet propres, types publics dédiés, targets MSBuild propres |
-| Ex: `WpsDebugSender.cs`, `WpsHKCU.cs`, `WpsFileHelper.cs`, `wpsServices.cs` | Ex: `Wps.Module.Sdk`, `Wps.Host.Sdk`, futur `Wps.Licensing.*` |
+| Ex: `WpsDebugSender.cs`, `WpsHKCU.cs`, `WpsFileHelper.cs`, `wpsServices.cs`, `WpsDeployVerifier.cs`, `WpsGenerateManifest.ps1` | Ex: `Wps.Module.Sdk`, `Wps.Host.Sdk`, `Wps.StandaloneApp.Sdk`, `Wps.AppLauncher` |
 
 Choix du mode : si le composant est un fichier unique sans état partagé → `_libs/`. S'il a
 ses propres dépendances NuGet, ses types publics, ses targets de validation/déploiement, ou
@@ -44,6 +44,36 @@ Pour transformer une app existante en Module ou ModuleService :
 Ou plus simplement : déclencher le skill `wipisoft-module-converter` (cf.
 [`_skills/`](../_skills/)) qui automatise toute la procédure.
 
+### [`Apps/`](Apps/) — Apps wipiSoft standalone
+
+Pour les apps **lancées directement par l'utilisateur** (raccourci, double-clic, file
+association, drag-drop) — par opposition aux Modules/ModuleServices pilotés par un host.
+Ex: OuiPDF, MailTools.
+
+Architecture en 2 composants :
+
+```
+Wps.AppLauncher ────── launcher natif NativeAOT (~3 Mo, win-x64)
+                       compilé une seule fois, copié et renommé en <App>.exe
+                       par le post-build de chaque app standalone
+        │
+        └─→ Wps.StandaloneApp.Sdk ─── target MSBuild qui orchestre :
+              - copie de l'AppHost depuis obj/apphost.exe → <App>.app.exe
+              - copie du launcher → <App>.exe
+              - injection de l'icône via rcedit
+              - génération du manifest d'intégrité (WpsGenerateManifest.ps1)
+```
+
+Pour intégrer le SDK dans une app standalone : **[HOWTO Standalone](Apps/Wps.StandaloneApp.Sdk/HOWTO.md)**.
+
+Le launcher vérifie le manifest au démarrage (via `WpsDeployVerifier`, partagé avec les
+SDKs Modules) et fail-fast avec une `MessageBox` propre si le déploiement est corrompu —
+plus de dialogue runtime cryptique *"Install .NET Desktop Runtime"*. Il fait également
+office de **single-instance smart** : si l'app tourne déjà (mutex
+`wipiSoft.<App>.SingleInstance`), il transmet ses arguments via le pipe canonique
+`wipiSoft.<App>.Pipe` (1 ligne par fichier) et exit immédiatement, sans spawner un second
+AppHost qui mourrait aussitôt.
+
 ### `Licensing/` — (futur)
 
 Framework de licensing wipiSoft. À venir.
@@ -71,6 +101,30 @@ Les targets unifiés (`Wps.Module.Sdk.Core.targets`, importés transitivement) :
 
 Rétrocompat : l'ancienne convention `<WipiModule>true</WipiModule>` (avant `<WipiModuleKind>`)
 reste acceptée et est mappée automatiquement sur `Module`.
+
+## Conventions csproj communes (apps qui consomment Wps.StandaloneApp.Sdk)
+
+```xml
+<PropertyGroup>
+  <WipiAppKind>Standalone</WipiAppKind>
+  <WipiAppName>OuiPDF</WipiAppName>           <!-- sans espace, ni \ / : * ? " < > | -->
+  <WipiAppVersion>0.6.1</WipiAppVersion>
+  <Company>wipiSoft</Company>                 <!-- recommandé : détection wpsServices -->
+</PropertyGroup>
+
+<Import Project="..\..\..\_SDKs\Apps\Wps.StandaloneApp.Sdk\Wps.StandaloneApp.Sdk.targets" />
+```
+
+L'app doit aligner son single-instance sur les noms canoniques attendus par le launcher :
+
+| Élément | Nom |
+|---|---|
+| Mutex single-instance | `wipiSoft.<AppName>.SingleInstance` |
+| Named pipe IPC        | `wipiSoft.<AppName>.Pipe`           |
+| Protocole pipe        | 1 ligne par argument, lecture jusqu'à EOF du stream |
+
+Override possible : `<WipiSkipLauncher>true</WipiSkipLauncher>` désactive la transformation
+post-build (utile pour debugger directement le `<App>.exe` natif sans la couche launcher).
 
 ## Licence
 
