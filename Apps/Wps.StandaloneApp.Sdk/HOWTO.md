@@ -277,8 +277,24 @@ Pour valider la chaîne :
 | Propriété | Effet |
 |---|---|
 | `<WipiSkipLauncher>true</WipiSkipLauncher>` | Désactive complètement la transformation post-build (utile pour debugger directement le `<App>.exe` natif sans la couche launcher). |
+| `<WipiSkipForceClean>true</WipiSkipForceClean>` | Désactive le clean automatique de `$(TargetDir)` en Release (cf. ci-dessous). À utiliser quand on veut un rebuild incrémental Release rapide pour un test ponctuel. |
 | `<WpsLauncherSrc>...</WpsLauncherSrc>` | Path custom vers `Wps.AppLauncher.exe` (par défaut : `_SDKs/Apps/Wps.AppLauncher/published/win-x64/Wps.AppLauncher.exe`). |
 | `<WpsRceditPath>...</WpsRceditPath>` | Path custom vers `rcedit-x64.exe` (par défaut : `_tools/rcedit-x64.exe`). Si absent, l'injection d'icône est silencieusement skippée. |
+
+## Build Release : clean automatique du `TargetDir`
+
+En **Release** uniquement, la cible `WpsForceCleanInRelease` supprime
+`$(TargetDir)` avant chaque build (`BeforeTargets=BeforeBuild`). Garantit que
+le manifest d'intégrité ne contient que les fichiers réellement produits par
+le build courant — pas les artefacts résiduels d'un build précédent (raccourci
+`.lnk` créé manuellement, `.bak` d'un éditeur, fichier de test laissé là, etc.)
+qui causeraient des "fichier manquant" / "fichier corrompu" au prochain
+démarrage si l'utilisateur les déplace.
+
+**En Debug**, le clean automatique est désactivé : on garde l'incrémentalité
+MSBuild rapide pour le cycle de dev. Les `$nameExcludes` / `$pathExcludes` du
+PS1 absorbent les artefacts courants. Si tu vois apparaître un faux positif
+"Fichier manquant" en Debug, fais un `dotnet clean` ponctuel.
 
 ## Pièges courants
 

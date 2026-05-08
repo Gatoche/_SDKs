@@ -52,6 +52,36 @@
     <AssemblyMetadata Include="WipiAppKind" Value="$(WipiAppKind)" />
   </ItemGroup>
 
+  <!--
+    Cible : nettoyage force du TargetDir avant chaque build Release.
+
+    Le manifest d'integrite scanne $(TargetDir) en post-build pour checksummer
+    chaque fichier. Sans clean prealable, des fichiers polluants accumules par
+    des builds incrementaux precedents (raccourcis .lnk crees a la main, fichiers
+    .bak d'editeurs, copies de test, etc.) entrent dans le manifest. Si ces
+    fichiers disparaissent ensuite (le user epingle/deplace le raccourci), le
+    launcher refuse de demarrer l'app au prochain run avec "Fichier manquant".
+
+    Garantie absolue de reproductibilite en Release. En Debug, on reste sur
+    l'incrementalite MSBuild standard (les patterns d'exclusion du PS1 absorbent
+    les artefacts courants).
+
+    Override possible : <WipiSkipForceClean>true</WipiSkipForceClean> pour
+    debugger une situation Release sans repayer le rebuild from scratch.
+  -->
+  <Target Name="WpsForceCleanInRelease"
+          BeforeTargets="BeforeBuild"
+          Condition="'$(WipiAppKind)' != ''
+                     and '$(Configuration)' == 'Release'
+                     and '$(WipiSkipForceClean)' != 'true'">
+
+    <Message Importance="high"
+             Text="Wps.StandaloneApp.Sdk: nettoyage force de '$(TargetDir)' avant build Release (integrite manifest)." />
+
+    <RemoveDir Directories="$(TargetDir)"
+               Condition="Exists('$(TargetDir)')" />
+  </Target>
+
   <!-- Validation : WipiAppName ne doit pas contenir d'espace ni de char Windows interdit. -->
   <Target Name="WpsValidateAppName"
           BeforeTargets="Build"
