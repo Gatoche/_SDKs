@@ -26,6 +26,65 @@ Ce SDK ajoute à l'app :
   ```
   (à refaire uniquement quand on change le code du launcher)
 
+## ⚠️ Règle d'or : aucun fichier ne doit être écrit dans le DeployDir au runtime
+
+Le manifest d'intégrité contient le **SHA-256 figé au build** de chaque fichier livré
+avec l'app. Si un fichier change après le build, le launcher dira *"Fichier corrompu"*
+au prochain démarrage et **refusera de lancer l'app** — alors que l'objectif du SDK
+est précisément l'inverse : prévenir l'instabilité, pas en créer.
+
+**Avant d'intégrer le SDK à une app, vérifier que l'app ne crée AUCUN fichier dans
+son dossier d'installation au runtime.** Tout ce qui change à l'usage doit aller :
+
+| Ressource | Bon emplacement |
+|---|---|
+| Cache, données utilisateur | `%LOCALAPPDATA%\<AppName>\` |
+| Préférences, settings utilisateur | `%LOCALAPPDATA%\<AppName>\` ou `HKCU\Software\wipiSoft\<AppName>\` |
+| Logs | `%LOCALAPPDATA%\<AppName>\logs\` (ou wipiLOG via `WpsDebugSender`) |
+| Cache WebView2 | **`CoreWebView2EnvironmentOptions.UserDataFolder`** redirigé vers `%LOCALAPPDATA%\<AppName>\WebView2\` |
+
+Pièges classiques à chasser **avant** la première intégration :
+
+1. **WebView2 par défaut** : crée `<App>.app.exe.WebView2/EBWebView/...` à côté de
+   l'exe (Crashpad, settings.dat, component_crx_cache, ~290 fichiers volatiles).
+   Configurer explicitement `UserDataFolder` à la création de l'environnement :
+   ```csharp
+   var userDataFolder = Path.Combine(
+       Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+       "<AppName>", "WebView2");
+   if (!Directory.Exists(userDataFolder)) Directory.CreateDirectory(userDataFolder);
+   var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
+   await webView2.EnsureCoreWebView2Async(env);
+   ```
+   Mutualiser l'env via un `Lazy<Task<CoreWebView2Environment>>` static si plusieurs
+   instances WebView2 coexistent (sinon WebView2 lance *"different environments"*).
+2. **PDF.js / autre archive zip extraite** : par défaut on extrait à côté de l'exe.
+   Rediriger vers `%LOCALAPPDATA%\<AppName>\` (l'archive `.zip` reste dans le
+   DeployDir, protégée — l'extraction live ailleurs).
+3. **WPF window state persisté en local** : du genre `<App>WindowStateSettings.json`
+   à côté de l'exe — déplacer vers `%LOCALAPPDATA%`.
+4. **`File.WriteAllText` dans `AppDomain.CurrentDomain.BaseDirectory`** : détecter
+   les écritures relatives à l'exe (logs, dumps, temp files...).
+
+### Exclusions par défaut dans le PS1
+
+Le générateur de manifest (`WpsGenerateManifest.ps1`) maintient une liste **minimale**
+de patterns runtime à ignorer :
+
+```powershell
+$pathExcludes = @(
+    "*WindowStateSettings.json"  # convention WPF locale
+)
+```
+
+`*.WebView2/*` n'y est **pas** : si une app oublie de rediriger `UserDataFolder`,
+le manifest la coincera au premier démarrage suivant — c'est le signal voulu
+(le bug est forcé tôt, pas en prod chez un client).
+
+⚠️ **Règle stricte** : on n'allonge cette liste qu'en dernier recours. Chaque pattern
+ajouté = surface non vérifiée par le launcher = risque qu'un fichier corrompu passe
+inaperçu. **Préférer toujours rediriger l'écriture hors du DeployDir** côté code app.
+
 ## Checklist d'intégration
 
 ### 1. csproj de l'app
@@ -47,7 +106,79 @@ Importer les targets à la fin (avant `</Project>`) :
 Le chemin relatif suppose une app dans `dev/<repo>/<sub>/<App>/`. Ajuste si l'arborescence
 diffère.
 
-### 2. Single-instance canonique côté app
+### 2. AUMID canonique (`WpsAppUserModelId`)
+
+Sans config, Windows considère `<App>.exe` (launcher) et `<App>.app.exe` (AppHost)
+comme deux apps distinctes → **deux icônes taskbar** (l'icône épinglée + l'icône de
+la fenêtre AppHost). Pour les regrouper, le launcher et l'AppHost doivent partager
+le **même AppUserModelID** (`wipiSoft.<AppName>`).
+
+> ⚠️ **Le shortcut taskbar doit pointer sur `<App>.exe` (le launcher), PAS sur
+> `<App>.app.exe`.** L'épinglage manuel "à partir d'une icône de fenêtre déjà
+> ouverte" épingle le path du process actif (= l'AppHost) — c'est un piège. Pour
+> épingler correctement : faire clic-droit sur `<App>.exe` dans l'explorateur →
+> "Épingler à la barre des tâches". Si on épingle `<App>.app.exe`, le shortcut
+> contourne le launcher (= pas de vérification manifest, et `WpsAppGuard` fait
+> exit silencieusement → l'app ne se lance pas du tout depuis ce shortcut).
+
+- Le **launcher** (`Wps.AppLauncher`) appelle `WpsAppUserModelId.SetCurrentProcess(appName)`
+  au début de `Main`. Rien à faire côté SDK.
+- L'**AppHost** doit appeler la même méthode au tout début d'`OnStartup`,
+  **avant toute création de fenêtre WPF** (sinon Windows a déjà attribué l'AUMID
+  par défaut à la fenêtre, et le set ultérieur n'a plus d'effet sur elle) :
+
+  ```csharp
+  protected override void OnStartup(StartupEventArgs e)
+  {
+      WpsAppUserModelId.SetCurrentProcess("<AppName>");
+      // ... suite normale du démarrage
+  }
+  ```
+
+  Source-link dans le csproj :
+
+  ```xml
+  <Compile Include="..\..\..\_libs\WpsAppUserModelId.cs" Link="Helpers\WpsAppUserModelId.cs" />
+  ```
+
+### 3. Garde-fou anti-lancement direct (`WpsAppGuard`)
+
+L'AppHost `<App>.app.exe` ne doit **pas** pouvoir être exécuté directement (double-clic, CLI
+explicite). Seul `<App>.exe` (le launcher) doit pouvoir le démarrer, car lui seul vérifie
+l'intégrité du déploiement avant le start.
+
+Mécanisme :
+
+- Le **launcher** définit la variable d'environnement `WPS_LAUNCHER_TOKEN` à un token
+  canonique avant `Process.Start` de l'AppHost. La variable est héritée par le child.
+- L'**AppHost** appelle `WpsAppGuard.EnsureLaunchedByLauncherOrExit()` au tout début
+  d'`OnStartup` (avant toute création de fenêtre). Si le token est absent ou invalide,
+  l'AppHost fait `Environment.Exit(1)` **silencieusement** (pas de MessageBox, pas de
+  fenêtre — l'utilisateur qui a double-cliqué par erreur ne voit rien apparaître).
+- **Bypass debug** : `Debugger.IsAttached` court-circuite le check. Permet le `F5` direct
+  sur l'AppHost depuis Visual Studio.
+
+Source-link `WpsAppGuard.cs` dans le csproj de l'app :
+
+```xml
+<Compile Include="..\..\..\_libs\WpsAppGuard.cs" Link="Helpers\WpsAppGuard.cs" />
+```
+
+Et appel au tout début d'`App.OnStartup` (WPF) ou `Main` (console / WinForms) :
+
+```csharp
+protected override void OnStartup(StartupEventArgs e)
+{
+    WpsAppGuard.EnsureLaunchedByLauncherOrExit();
+    // ... suite normale du démarrage
+}
+```
+
+> **Sécurité** : ce n'est pas un mécanisme contre un attaquant déterminé (un user qui sait
+> peut définir la variable manuellement). C'est une protection contre les **doubles-clics
+> par erreur** sur `.app.exe` qui contournent la vérification d'intégrité du manifest.
+
+### 4. Single-instance canonique côté app
 
 Le launcher attend les noms IPC suivants (alignés sur `WipiAppName`) :
 
@@ -72,24 +203,38 @@ if (!isFirst)
 StartPipeServer(); // accept connections from launcher when files are dropped on <App>.exe
 ```
 
-### 3. Protocole pipe
+### 5. Protocole pipe
 
 Le launcher envoie **un argument par ligne** sur le pipe, puis ferme la connexion
 (EOF). Le serveur lit en boucle :
 
 ```csharp
 using var reader = new StreamReader(pipeServer);
+var paths = new List<string>();
 string? line;
 while ((line = await reader.ReadLineAsync()) is not null)
 {
-    if (!string.IsNullOrEmpty(line)) OpenFile(line);
+    if (!string.IsNullOrEmpty(line)) paths.Add(line);
 }
+
+Application.Current.Dispatcher.Invoke(() =>
+{
+    BringToForeground();          // TOUJOURS, qu'il y ait des paths ou non
+    foreach (var p in paths) OpenFile(p);
+});
 ```
 
 Pas de format JSON, pas de message-mode. Une simple ligne = un fichier, lecture
 jusqu'à EOF.
 
-### 4. Build
+**Cas du double-clic à vide** : si l'utilisateur double-clique sur `<App>.exe`
+alors que l'app tourne déjà, le launcher se connecte au pipe sans rien écrire
+(args vide → 0 ligne) puis ferme. Côté serveur, c'est le signal *"reveille-toi"*
+→ l'instance fait `BringToForeground` même sans paths à ouvrir. **Ne pas
+court-circuiter** ce cas en testant `args.Length == 0` avant la connexion ni
+en bypassant `BringToForeground` quand `paths.Count == 0`.
+
+### 6. Build
 
 ```bash
 dotnet build <App>.csproj -c Release -p:Platform=x64
@@ -115,7 +260,7 @@ OuiPDF.deploy.guid               ← scellé du manifest (32 hex chars)
 ... + autres fichiers
 ```
 
-### 5. Test
+### 7. Test
 
 Pour valider la chaîne :
 

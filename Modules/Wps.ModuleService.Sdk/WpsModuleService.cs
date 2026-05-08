@@ -1,8 +1,6 @@
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
-using System.Windows.Interop;
 using Wps.Module;
 
 namespace Wps.ModuleService;
@@ -196,79 +194,13 @@ public static class WpsModuleService
         return "";
     }
 
-    // ====== BringToForegroundAndClick : amène la fenêtre au premier plan + clic synth ======
-    //
-    // Quand le service reçoit SHOW_SETTINGS du host, l'host est encore le foreground actif et
-    // Windows refuse d'arracher le focus à un process tiers (sécurité Win10/11). Résultat :
-    // window.Show() + Activate() ne suffit pas — la fenêtre apparaît mais reste derrière, et
-    // l'icône taskbar clignote pour signaler "tu as une nouvelle fenêtre".
-    //
-    // Solution standard Win32 : AttachThreadInput sur le thread du foreground actif (cela
-    // donne à notre thread la même "input queue" → SetForegroundWindow accepté). Puis un clic
-    // synthétique via PostMessage(WM_LBUTTONDOWN/UP) : l'OS considère qu'un input a été reçu
-    // dans la fenêtre → arrête le clignotement taskbar.
-
-    /// <summary>Force la <paramref name="window"/> au premier plan via AttachThreadInput, puis
-    /// envoie un clic synthétique (WM_LBUTTONDOWN/UP) au HWND pour stopper l'alerte taskbar.
-    /// À appeler après <see cref="Window.Show"/>. Utile aussi pour ramener une fenêtre déjà
-    /// ouverte (cas d'un 2e SHOW_SETTINGS).</summary>
+    /// <summary>Force la <paramref name="window"/> au premier plan + clic synthétique
+    /// pour stopper l'alerte taskbar. À appeler après <see cref="Window.Show"/>. Utile
+    /// aussi pour ramener une fenêtre déjà ouverte (cas d'un 2e SHOW_SETTINGS).
+    ///
+    /// <para>Implémentation : déléguée à <see cref="wipisoft.WpsForegroundBringer.BringToForegroundAndClick"/>
+    /// (helper partagé via <c>_libs/</c> avec les apps wipiSoft standalone).</para>
+    /// </summary>
     public static void BringToForegroundAndClick(Window window)
-    {
-        if (window is null) return;
-        var hwnd = new WindowInteropHelper(window).Handle;
-        if (hwnd == IntPtr.Zero) return;
-
-        if (window.WindowState == WindowState.Minimized)
-            window.WindowState = WindowState.Normal;
-
-        var fg = GetForegroundWindow();
-        uint thisThread = GetCurrentThreadId();
-        uint fgThread = GetWindowThreadProcessId(fg, out _);
-        bool attached = false;
-        if (thisThread != fgThread && fgThread != 0)
-            attached = AttachThreadInput(fgThread, thisThread, true);
-
-        try
-        {
-            BringWindowToTop(hwnd);
-            SetForegroundWindow(hwnd);
-            window.Activate();
-
-            // Clic synthétique via PostMessage : pas besoin de bouger le curseur, l'OS
-            // considère qu'un input a été reçu → stoppe l'alerte taskbar.
-            const int WM_LBUTTONDOWN = 0x0201;
-            const int WM_LBUTTONUP = 0x0202;
-            PostMessage(hwnd, WM_LBUTTONDOWN, IntPtr.Zero, IntPtr.Zero);
-            PostMessage(hwnd, WM_LBUTTONUP, IntPtr.Zero, IntPtr.Zero);
-        }
-        finally
-        {
-            if (attached) AttachThreadInput(fgThread, thisThread, false);
-        }
-    }
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetForegroundWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool BringWindowToTop(IntPtr hWnd);
-
-    [DllImport("kernel32.dll")]
-    private static extern uint GetCurrentThreadId();
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+        => wipisoft.WpsForegroundBringer.BringToForegroundAndClick(window);
 }

@@ -17,4 +17,11 @@
     <ProjectReference Include="..\Wps.Module.Sdk.Core\Wps.Module.Sdk.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Helper partagé "amener une fenêtre WPF au premier plan + clic synthétique"
+         (cf. BringToForegroundAndClick). Source-linké aussi par les apps standalone
+         qui en ont besoin pour traiter les double-clics sur leur launcher. -->
+    <Compile Include="..\..\..\_libs\WpsForegroundBringer.cs" Link="WpsForegroundBringer.cs" />
+  </ItemGroup>
+
 </Project>

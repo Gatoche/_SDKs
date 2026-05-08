@@ -23,6 +23,7 @@ using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Wps.Module.Core;
+using wipisoft;
 
 namespace Wps.AppLauncher;
 
@@ -45,6 +46,11 @@ internal static class Program
             var deployDir = Path.GetDirectoryName(ownExePath)
                 ?? throw new InvalidOperationException("Impossible de déterminer deployDir");
             appName = Path.GetFileNameWithoutExtension(ownExePath);
+
+            // AUMID canonique wipiSoft.<AppName> : meme valeur cote launcher et cote AppHost
+            // → Windows regroupe les deux exe sous une seule icone taskbar (sinon la fenetre
+            // de OuiPDF.app.exe creerait une icone distincte de OuiPDF.exe epinglee).
+            WpsAppUserModelId.SetCurrentProcess(appName);
 
             // 1) Vérification de l'intégrité du déploiement (manifest + master guid)
             var verify = WpsDeployVerifier.Verify(deployDir, appName);
@@ -94,6 +100,9 @@ internal static class Program
                 UseShellExecute = false,
                 WorkingDirectory = deployDir,
             };
+            // Token de provenance : permet à l'AppHost (via WpsAppGuard) de detecter
+            // qu'il a bien ete lance par ce launcher et pas directement double-clique.
+            psi.Environment[WpsAppGuard.LauncherTokenEnvVar] = WpsAppGuard.LauncherTokenValue;
             // Transmet les args tels quels (file associations, drag-drop, CLI).
             foreach (var a in args) psi.ArgumentList.Add(a);
             Process.Start(psi);
@@ -130,12 +139,16 @@ internal static class Program
     }
 
     /// <summary>
-    /// Envoie les args à l'instance existante via le pipe canonique.
-    /// Protocole : 1 ligne par argument. Le serveur lit jusqu'à EOF du stream.
+    /// Notifie l'instance existante via le pipe canonique.
+    /// Protocole : 1 ligne par argument, le serveur lit jusqu'à EOF du stream.
+    ///
+    /// <para>Une connexion vide (args vide) a un sens metier : c'est le signal
+    /// "double-clic supplementaire sur &lt;App&gt;.exe sans fichier" → l'instance
+    /// existante doit faire un BringToForeground. On ouvre donc TOUJOURS le pipe,
+    /// meme avec args vide.</para>
     /// </summary>
     private static bool TrySendArgsViaPipe(string appName, string[] args)
     {
-        if (args.Length == 0) return true; // rien à transmettre, succès trivial
         var pipeName = $"wipiSoft.{appName}.Pipe";
         try
         {
@@ -148,6 +161,8 @@ internal static class Program
                 if (string.IsNullOrEmpty(a)) continue;
                 w.WriteLine(a);
             }
+            // Si args est vide : le writer.Dispose() ferme le stream sans rien ecrire.
+            // Le serveur lit 0 ligne → BringToForeground sans openPdfFile.
             return true;
         }
         catch

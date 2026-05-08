@@ -36,6 +36,12 @@
          Depuis _SDKs/Apps/Wps.AppLauncher/, on remonte 3 niveaux jusqu'à dev/. -->
     <Compile Include="..\..\..\_libs\WpsDebugSender.cs" Link="WpsDebugSender.cs" />
     <Compile Include="..\..\..\_libs\WpsDeployVerifier.cs" Link="WpsDeployVerifier.cs" />
+    <!-- WpsAppGuard : partage les constantes du token launcher avec les apps standalone
+         (le launcher définit la variable, le guard côté app la vérifie). -->
+    <Compile Include="..\..\..\_libs\WpsAppGuard.cs" Link="WpsAppGuard.cs" />
+    <!-- WpsAppUserModelId : AUMID canonique partagé avec l'AppHost pour que Windows
+         regroupe les deux exe sous une seule icône taskbar. -->
+    <Compile Include="..\..\..\_libs\WpsAppUserModelId.cs" Link="WpsAppUserModelId.cs" />
   </ItemGroup>
 
   <!-- Cross-compilation : la machine de dev étant ARM64 alors que le launcher cible
