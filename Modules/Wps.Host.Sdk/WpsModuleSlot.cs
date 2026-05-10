@@ -340,6 +340,125 @@ public sealed class WpsModuleSlot : IDisposable, IWpsShutdownTarget
         }
     }
 
+    /// <summary>(v1.3) Attend la résolution d'un Busy en cours côté module. À utiliser après
+    /// que <see cref="RequestCanCloseAsync"/> ait retourné <see cref="CanCloseResponse.Busy"/>
+    /// pour observer la transition finale (Ok / NeedUser / Rejected) sans envoyer de nouveau
+    /// CAN_CLOSE au module.
+    ///
+    /// <para>Watchdog : si le module reste silencieux (pas de BUSY_PROGRESS et pas de transition
+    /// finale) pendant <see cref="ShutdownOptions.BusyHeartbeatTimeoutMs"/>, on présume un
+    /// deadlock et on retourne <see cref="CanCloseResponse.Timeout"/>. L'orchestrateur passera
+    /// alors au Kill direct via <see cref="CompleteShutdownAsync"/>.</para>
+    ///
+    /// <para>Surveille aussi <see cref="ProcessExited"/> : si le process meurt pendant le Busy,
+    /// retourne immédiatement <see cref="CanCloseResponse.Timeout"/> (le caller traitera comme
+    /// AlreadyExited dans <see cref="CompleteShutdownAsync"/>).</para></summary>
+    public async Task<CanCloseResponse> WaitForBusyResolutionAsync(ShutdownOptions opts, CancellationToken ct = default)
+    {
+        if (_disposed || _connection is null) return CanCloseResponse.Ok;
+
+        var tcs = new TaskCompletionSource<CanCloseResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lastSignalUtc = DateTime.UtcNow;
+
+        // Subscriptions : tous les events de transition finale + ceux qui prouvent que le
+        // module avance (BUSY_PROGRESS et CAN_CLOSE_BUSY répété qui fait reset du watchdog).
+        Action onOk = () => tcs.TrySetResult(CanCloseResponse.Ok);
+        Action<int, string> onBusyAgain = (_, _) => lastSignalUtc = DateTime.UtcNow;
+        Action<string> onNeedUser = reason => tcs.TrySetResult(CanCloseResponse.NeedUser(reason));
+        Action<string> onRejected = reason => tcs.TrySetResult(CanCloseResponse.Rejected(reason));
+        Action<int, string> onProgress = (_, _) => lastSignalUtc = DateTime.UtcNow;
+        Action onProcessExited = () => tcs.TrySetResult(CanCloseResponse.Timeout);
+
+        _connection.CanCloseOk += onOk;
+        _connection.CanCloseBusy += onBusyAgain;
+        _connection.CanCloseNeedUser += onNeedUser;
+        _connection.CanCloseRejected += onRejected;
+        _connection.BusyProgressReceived += onProgress;
+        ProcessExited += onProcessExited;
+
+        try
+        {
+            // Boucle : poll non bloquant qui surveille le silence. Le wait réel est dans
+            // tcs.Task → réveil sur n'importe quel event ci-dessus, instant.
+            while (!tcs.Task.IsCompleted)
+            {
+                if (ct.IsCancellationRequested)
+                {
+                    tcs.TrySetCanceled(ct);
+                    break;
+                }
+                var silenceMs = (DateTime.UtcNow - lastSignalUtc).TotalMilliseconds;
+                if (silenceMs > opts.BusyHeartbeatTimeoutMs)
+                {
+                    var sidShort = string.IsNullOrEmpty(_sessionId) ? "?" : _sessionId[..Math.Min(8, _sessionId.Length)];
+                    WpsDebugSender.Log(
+                        $"WaitForBusyResolutionAsync [{sidShort}]: silence Busy > {opts.BusyHeartbeatTimeoutMs}ms — Timeout (deadlock présumé)",
+                        LogLevel.Warning, LogTag);
+                    tcs.TrySetResult(CanCloseResponse.Timeout);
+                    break;
+                }
+                // Attente bornée : se réveille soit sur un event (TCS complete), soit sur le
+                // tick de poll pour re-vérifier le silence.
+                var poll = Task.Delay(500, ct);
+                await Task.WhenAny(tcs.Task, poll).ConfigureAwait(false);
+            }
+            return await tcs.Task.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return CanCloseResponse.Timeout;
+        }
+        finally
+        {
+            _connection.CanCloseOk -= onOk;
+            _connection.CanCloseBusy -= onBusyAgain;
+            _connection.CanCloseNeedUser -= onNeedUser;
+            _connection.CanCloseRejected -= onRejected;
+            _connection.BusyProgressReceived -= onProgress;
+            ProcessExited -= onProcessExited;
+        }
+    }
+
+    /// <summary>(v1.3) Variante de <see cref="WaitForBusyResolutionAsync"/> pour le pattern
+    /// NEED_USER : pas de watchdog silence (l'utilisateur peut prendre tout son temps avec
+    /// son dialog applicatif). Cf. <see cref="IWpsShutdownTarget.WaitForNeedUserResolutionAsync"/>
+    /// pour la doc complète.</summary>
+    public async Task<CanCloseResponse> WaitForNeedUserResolutionAsync(ShutdownOptions opts, CancellationToken ct = default)
+    {
+        if (_disposed || _connection is null) return CanCloseResponse.Ok;
+
+        var tcs = new TaskCompletionSource<CanCloseResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Action onOk = () => tcs.TrySetResult(CanCloseResponse.Ok);
+        Action<int, string> onBusy = (estMs, reason) => tcs.TrySetResult(CanCloseResponse.Busy(estMs, reason));
+        Action<string> onRejected = reason => tcs.TrySetResult(CanCloseResponse.Rejected(reason));
+        Action onProcessExited = () => tcs.TrySetResult(CanCloseResponse.Timeout);
+
+        _connection.CanCloseOk += onOk;
+        _connection.CanCloseBusy += onBusy;       // l'app pourrait passer NeedUser → Busy via ResolveCanClose
+        _connection.CanCloseRejected += onRejected;
+        ProcessExited += onProcessExited;
+
+        // PAS de subscription onProgress / onBusyAgain pour reset un watchdog : il n'y en a pas.
+        // PAS de subscription onNeedUser : on est DÉJÀ en NeedUser, on attend la sortie.
+
+        // Cancellation : si le ct est annulé (host annulé pour autre raison), on remonte Timeout
+        // pour que le caller puisse traiter comme un cas dégradé.
+        using var ctReg = ct.Register(() => tcs.TrySetResult(CanCloseResponse.Timeout));
+
+        try
+        {
+            return await tcs.Task.ConfigureAwait(false);
+        }
+        finally
+        {
+            _connection.CanCloseOk -= onOk;
+            _connection.CanCloseBusy -= onBusy;
+            _connection.CanCloseRejected -= onRejected;
+            ProcessExited -= onProcessExited;
+        }
+    }
+
     /// <summary>(v1.3) API tout-en-un pour les call sites simples (toggle daemon, Stop pageslot).
     /// Route automatiquement vers le flow négocié v1.3 (CAN_CLOSE → CompleteShutdown) ou le
     /// fallback v1.2 (CLOSE direct + grace + Kill) selon la version contrat du module.

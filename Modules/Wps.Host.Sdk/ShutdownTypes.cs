@@ -143,6 +143,33 @@ public interface IWpsShutdownTarget
     /// <summary>Phase 1 : envoie CAN_CLOSE et attend la réponse (Ok/Busy/NeedUser/Rejected/Timeout).</summary>
     Task<CanCloseResponse> RequestCanCloseAsync(ShutdownOptions opts, System.Threading.CancellationToken ct);
 
+    /// <summary>(v1.3) Attend la résolution d'un Busy en cours côté module : écoute les events
+    /// <c>CanCloseOk</c> (résolution en Ok), <c>CanCloseNeedUser</c>/<c>CanCloseRejected</c>
+    /// (changement de décision), et <c>BusyProgressReceived</c> (reset du watchdog silence).
+    /// Retourne la nouvelle <see cref="CanCloseResponse"/> dès que le module sort de l'état
+    /// Busy, ou <see cref="CanCloseResponse.Timeout"/> si silence &gt;
+    /// <see cref="ShutdownOptions.BusyHeartbeatTimeoutMs"/> entre 2 BUSY_PROGRESS (deadlock
+    /// présumé).
+    /// <para>Contrairement à <see cref="RequestCanCloseAsync"/>, n'envoie PAS de nouveau
+    /// CAN_CLOSE — on écoute juste les notifications du module qui a déjà répondu Busy en
+    /// phase 1.</para></summary>
+    Task<CanCloseResponse> WaitForBusyResolutionAsync(ShutdownOptions opts, System.Threading.CancellationToken ct);
+
+    /// <summary>(v1.3) Attend la résolution d'un NeedUser en cours côté module : l'utilisateur
+    /// est en train d'interagir avec le dialog applicatif (Yes/No/Cancel ou similaire). Le
+    /// module n'envoie aucun signal pendant ce temps — il attend simplement que l'humain
+    /// tranche. <b>Aucun watchdog silence</b> côté host : l'utilisateur peut prendre tout son
+    /// temps (réfléchir, déplacer la souris, basculer vers une autre app, etc.).
+    /// <para>Retourne dès que le module appelle <c>WpsModule.ResolveCanClose</c> avec sa
+    /// décision finale, qui arrive ici via les events <c>CanCloseOk</c> / <c>CanCloseRejected</c>
+    /// / <c>CanCloseBusy</c> (dialog tranché en "encore un peu de boulot" — rare). Annulation
+    /// possible uniquement via le <see cref="System.Threading.CancellationToken"/>.</para>
+    /// <para>Cette méthode existe SÉPARÉMENT de <see cref="WaitForBusyResolutionAsync"/> car
+    /// le watchdog silence-Busy est inadapté pour NeedUser : un dialog peut rester ouvert plusieurs
+    /// dizaines de secondes voire minutes. Le SDK ne doit pas forcer un Kill silencieux pendant
+    /// qu'un humain réfléchit.</para></summary>
+    Task<CanCloseResponse> WaitForNeedUserResolutionAsync(ShutdownOptions opts, System.Threading.CancellationToken ct);
+
     /// <summary>Annulation cascade : libère le verrou côté module (qui repassera Idle après
     /// avoir reçu CAN_CLOSE_ABORTED).</summary>
     Task SendCanCloseAbortedAsync();

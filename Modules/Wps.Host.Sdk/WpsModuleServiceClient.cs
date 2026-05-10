@@ -403,6 +403,99 @@ public sealed class WpsModuleServiceClient : IDisposable, IWpsShutdownTarget
         }
     }
 
+    /// <inheritdoc cref="WpsModuleSlot.WaitForBusyResolutionAsync"/>
+    public async Task<CanCloseResponse> WaitForBusyResolutionAsync(ShutdownOptions opts, CancellationToken ct = default)
+    {
+        if (_disposed || _connection is null) return CanCloseResponse.Ok;
+
+        var tcs = new TaskCompletionSource<CanCloseResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lastSignalUtc = DateTime.UtcNow;
+
+        Action onOk = () => tcs.TrySetResult(CanCloseResponse.Ok);
+        Action<int, string> onBusyAgain = (_, _) => lastSignalUtc = DateTime.UtcNow;
+        Action<string> onNeedUser = reason => tcs.TrySetResult(CanCloseResponse.NeedUser(reason));
+        Action<string> onRejected = reason => tcs.TrySetResult(CanCloseResponse.Rejected(reason));
+        Action<int, string> onProgress = (_, _) => lastSignalUtc = DateTime.UtcNow;
+        Action onProcessExited = () => tcs.TrySetResult(CanCloseResponse.Timeout);
+
+        _connection.CanCloseOk += onOk;
+        _connection.CanCloseBusy += onBusyAgain;
+        _connection.CanCloseNeedUser += onNeedUser;
+        _connection.CanCloseRejected += onRejected;
+        _connection.BusyProgressReceived += onProgress;
+        ProcessExited += onProcessExited;
+
+        try
+        {
+            while (!tcs.Task.IsCompleted)
+            {
+                if (ct.IsCancellationRequested)
+                {
+                    tcs.TrySetCanceled(ct);
+                    break;
+                }
+                var silenceMs = (DateTime.UtcNow - lastSignalUtc).TotalMilliseconds;
+                if (silenceMs > opts.BusyHeartbeatTimeoutMs)
+                {
+                    var sidShort = string.IsNullOrEmpty(_sessionId) ? "?" : _sessionId[..Math.Min(8, _sessionId.Length)];
+                    WpsDebugSender.Log(
+                        $"WaitForBusyResolutionAsync [{sidShort}]: silence Busy > {opts.BusyHeartbeatTimeoutMs}ms — Timeout (deadlock présumé)",
+                        LogLevel.Warning, LogTag);
+                    tcs.TrySetResult(CanCloseResponse.Timeout);
+                    break;
+                }
+                var poll = Task.Delay(500, ct);
+                await Task.WhenAny(tcs.Task, poll).ConfigureAwait(false);
+            }
+            return await tcs.Task.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return CanCloseResponse.Timeout;
+        }
+        finally
+        {
+            _connection.CanCloseOk -= onOk;
+            _connection.CanCloseBusy -= onBusyAgain;
+            _connection.CanCloseNeedUser -= onNeedUser;
+            _connection.CanCloseRejected -= onRejected;
+            _connection.BusyProgressReceived -= onProgress;
+            ProcessExited -= onProcessExited;
+        }
+    }
+
+    /// <inheritdoc cref="WpsModuleSlot.WaitForNeedUserResolutionAsync"/>
+    public async Task<CanCloseResponse> WaitForNeedUserResolutionAsync(ShutdownOptions opts, CancellationToken ct = default)
+    {
+        if (_disposed || _connection is null) return CanCloseResponse.Ok;
+
+        var tcs = new TaskCompletionSource<CanCloseResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Action onOk = () => tcs.TrySetResult(CanCloseResponse.Ok);
+        Action<int, string> onBusy = (estMs, reason) => tcs.TrySetResult(CanCloseResponse.Busy(estMs, reason));
+        Action<string> onRejected = reason => tcs.TrySetResult(CanCloseResponse.Rejected(reason));
+        Action onProcessExited = () => tcs.TrySetResult(CanCloseResponse.Timeout);
+
+        _connection.CanCloseOk += onOk;
+        _connection.CanCloseBusy += onBusy;
+        _connection.CanCloseRejected += onRejected;
+        ProcessExited += onProcessExited;
+
+        using var ctReg = ct.Register(() => tcs.TrySetResult(CanCloseResponse.Timeout));
+
+        try
+        {
+            return await tcs.Task.ConfigureAwait(false);
+        }
+        finally
+        {
+            _connection.CanCloseOk -= onOk;
+            _connection.CanCloseBusy -= onBusy;
+            _connection.CanCloseRejected -= onRejected;
+            ProcessExited -= onProcessExited;
+        }
+    }
+
     /// <inheritdoc cref="WpsModuleSlot.ShutdownAsync(ShutdownOptions, CancellationToken)"/>
     public async Task<ShutdownResult> ShutdownAsync(ShutdownOptions opts, CancellationToken ct = default)
     {

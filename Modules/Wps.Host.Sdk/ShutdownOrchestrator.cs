@@ -63,11 +63,18 @@ public sealed class ShutdownOrchestrator
     /// séquence (target en cours, état, message). Utile pour un overlay UI dans le host.</param>
     /// <param name="ct">Cancellation pour annuler la séquence (ex: l'utilisateur annule la
     /// fermeture du host pendant un Busy long).</param>
+    /// <param name="onBeforeTargetClose">Callback optionnel invoqué (sur le UI thread du host)
+    /// juste avant que <c>CompleteShutdownAsync</c> ne soit appelé sur un target — i.e. juste
+    /// avant que le CLOSE final ne parte. Permet au host de capturer un dernier snapshot du
+    /// module et de parker son HWND, pour que l'utilisateur voie l'image figée du module
+    /// pendant le cleanup et le tear-down (au lieu d'une page noire quand le HWND est détruit).
+    /// Si null, pas de capture — comportement default.</param>
     public async Task<HostShutdownOutcome> ExecuteAsync(
         ShutdownOptions opts,
         Func<IWpsShutdownTarget, Task> onSwitchToTargetForUser,
         IProgress<ShutdownProgress>? progress = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Func<IWpsShutdownTarget, Task>? onBeforeTargetClose = null)
     {
         if (_targets.Count == 0) return HostShutdownOutcome.Completed;
 
@@ -152,8 +159,12 @@ public sealed class ShutdownOrchestrator
                     LogLevel.Warning, LogTag);
             }
 
-            // Attendre la décision finale (nouveau cycle CAN_CLOSE pour ce target spécifique)
-            var followup = await target.RequestCanCloseAsync(opts, ct).ConfigureAwait(false);
+            // Attendre la décision finale (l'utilisateur tranche son dialog Yes/No/Cancel et
+            // l'app appelle ResolveCanClose) via WaitForNeedUserResolutionAsync — méthode
+            // dédiée SANS watchdog silence : l'humain peut prendre tout le temps qu'il veut.
+            // ⚠️ Ne PAS utiliser RequestCanCloseAsync qui timeoute en CanCloseTimeoutMs (3s) —
+            // c'est insuffisant pour un dialog utilisateur, et ça forcerait CLOSE prématuré.
+            var followup = await target.WaitForNeedUserResolutionAsync(opts, ct).ConfigureAwait(false);
             canCloseResults[target] = followup;
 
             if (followup is CanCloseResponse.RejectedR rej)
@@ -175,9 +186,11 @@ public sealed class ShutdownOrchestrator
         // ====== Phase 4 : synchronisation des Busy (attente passage en Ok) ======
         // Les Busy doivent passer en Ok via un autre cycle (le module appelle ResolveCanClose
         // de son côté, ou ses BUSY_PROGRESS finissent par cesser et ResolveCanClose(Ok) arrive).
-        // On fait un nouveau RequestCanCloseAsync sur chaque Busy pour récupérer la décision
-        // mise à jour. Si toujours Busy après notre BusyHeartbeatTimeoutMs, on laissera
-        // CompleteShutdownAsync killer.
+        // On utilise WaitForBusyResolutionAsync qui s'abonne aux events CanCloseOk /
+        // CanCloseNeedUser / CanCloseRejected / BusyProgressReceived sans envoyer de nouveau
+        // CAN_CLOSE — pure écoute. Le fix d'un bug initial : un re-poll naïf renvoyait
+        // immédiatement Busy via le coalesce côté module, et l'orchestrateur enchaînait alors
+        // sur Phase 5 (CLOSE) sans respecter le travail en cours.
         var stillBusy = canCloseResults
             .Where(kv => kv.Value is CanCloseResponse.BusyR)
             .Select(kv => kv.Key)
@@ -185,22 +198,72 @@ public sealed class ShutdownOrchestrator
         if (stillBusy.Count > 0)
         {
             progress?.Report(new ShutdownProgress(null, ShutdownPhase.WaitingBusy, $"{stillBusy.Count} module(s) en cours…"));
-            // Note implementation : attente naïve en re-pollant CAN_CLOSE. Plus sophistiqué
-            // serait de s'abonner aux events CanCloseOk de la connexion, mais cela demande
-            // d'exposer ces events sur IWpsShutdownTarget. Pour le commit 7 minimal, on poll.
             await Task.WhenAll(stillBusy.Select(async t =>
             {
                 try
                 {
-                    var resp = await t.RequestCanCloseAsync(opts, ct).ConfigureAwait(false);
-                    lock (canCloseResults) canCloseResults[t] = resp;
+                    var resolved = await t.WaitForBusyResolutionAsync(opts, ct).ConfigureAwait(false);
+                    lock (canCloseResults) canCloseResults[t] = resolved;
+                    WpsDebugSender.Log($"Phase 4: '{t.Name}' Busy résolu → {resolved.GetType().Name}",
+                        LogLevel.Trace, LogTag);
                 }
-                catch { /* timeout ou cancel : on tombera sur Kill au CompleteShutdown */ }
+                catch (Exception ex)
+                {
+                    WpsDebugSender.Log($"Phase 4: '{t.Name}' WaitForBusyResolutionAsync threw {ex.GetType().Name}: {ex.Message}",
+                        LogLevel.Warning, LogTag);
+                }
             })).ConfigureAwait(false);
+
+            // Si la résolution de Busy a produit des Rejected, on doit traiter la cascade
+            // comme en phase 2. Les NeedUser tardifs (Busy → NeedUser) ne sont pas typiques
+            // mais possibles ; on les traite comme un Rejected pour simplifier (l'orchestrateur
+            // n'a plus de queue NeedUser à dérouler à ce stade — phase 3 est déjà passée).
+            // Si tu veux supporter Busy → NeedUser, il faudra rajouter une mini queue ici.
+            var lateRejected = canCloseResults.FirstOrDefault(kv =>
+                kv.Value is CanCloseResponse.RejectedR or CanCloseResponse.NeedUserR);
+            if (lateRejected.Key is not null)
+            {
+                var reason = lateRejected.Value switch
+                {
+                    CanCloseResponse.RejectedR r => r.Reason,
+                    CanCloseResponse.NeedUserR n => $"NeedUser tardif (post-Busy) : {n.Reason}",
+                    _ => "?",
+                };
+                WpsDebugSender.Log(
+                    $"Phase 4: '{lateRejected.Key.Name}' a tranché en {lateRejected.Value.GetType().Name} ({reason}) → cascade",
+                    LogLevel.Info, LogTag);
+                progress?.Report(new ShutdownProgress(lateRejected.Key, ShutdownPhase.Aborted, $"Refus tardif : {reason}"));
+
+                var lockedNow = canCloseResults
+                    .Where(kv => kv.Key != lateRejected.Key && kv.Value is CanCloseResponse.OkR)
+                    .Select(kv => kv.Key)
+                    .ToList();
+                await Task.WhenAll(lockedNow.Select(t => t.SendCanCloseAbortedAsync())).ConfigureAwait(false);
+                return HostShutdownOutcome.AbortedByModule;
+            }
         }
 
         // ====== Phase 5 : envoi CLOSE en parallèle + attente CLOSING_DONE ======
         progress?.Report(new ShutdownProgress(null, ShutdownPhase.Closing, "Phase finale : CLOSE parallèle"));
+
+        // Hook UI : juste avant le CLOSE final, on laisse le host capturer un snapshot du
+        // module et parker son HWND. L'utilisateur verra l'image figée du module pendant le
+        // cleanup + tear-down, pas une page noire quand le HWND est détruit. Invoqué pour
+        // tous les targets (v1.3 + legacy) qui vont effectivement être fermés.
+        if (onBeforeTargetClose is not null)
+        {
+            var allClosingTargets = v13Targets.Concat(legacyTargets).ToList();
+            foreach (var t in allClosingTargets)
+            {
+                try { await onBeforeTargetClose(t).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    WpsDebugSender.Log($"onBeforeTargetClose('{t.Name}') threw {ex.GetType().Name}: {ex.Message}",
+                        LogLevel.Warning, LogTag);
+                }
+            }
+        }
+
         var closeTasks = v13Targets.Select(async t =>
         {
             try
