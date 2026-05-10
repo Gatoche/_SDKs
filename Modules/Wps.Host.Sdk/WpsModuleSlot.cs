@@ -81,7 +81,7 @@ public sealed class WpsModuleSlot : IDisposable, IWpsShutdownTarget
     /// <summary>(v1.3) Émis si le module signale NEED_USER en cours de séquence (hors phase 1).
     /// Utile au pattern Busy → NeedUser : RequestCanCloseAsync n'aura renvoyé que Busy en phase 1,
     /// le passage en NeedUser arrive ultérieurement via cet event.</summary>
-    public event Action<string, string, WpsDialogButtons>? NeedUserSignaled;
+    public event Action<NeedUserPayload>? NeedUserSignaled;
 
     /// <summary>(v1.3) Émis quand le module se ferme à son initiative (SELF_CLOSING reçu).
     /// Permet au host de griser le slot proprement (état "Closed" plutôt que "Failed").</summary>
@@ -140,8 +140,8 @@ public sealed class WpsModuleSlot : IDisposable, IWpsShutdownTarget
         // l'orchestrateur (ou un caller direct) puisse s'y abonner sans connaître la connexion.
         _connection.BusyProgressReceived += (percent, msg) =>
             BusyProgressChanged?.Invoke(new HostBusyProgress(percent, msg));
-        _connection.CanCloseNeedUser += (reason, question, buttons) =>
-            NeedUserSignaled?.Invoke(reason, question, buttons);
+        _connection.CanCloseNeedUser += payload =>
+            NeedUserSignaled?.Invoke(payload);
         _connection.SelfClosing += reason =>
             SelfClosing?.Invoke(reason);
 
@@ -227,8 +227,8 @@ public sealed class WpsModuleSlot : IDisposable, IWpsShutdownTarget
         var tcs = new TaskCompletionSource<CanCloseResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
         Action onOk = () => tcs.TrySetResult(CanCloseResponse.Ok);
         Action<int, string> onBusy = (estMs, reason) => tcs.TrySetResult(CanCloseResponse.Busy(estMs, reason));
-        Action<string, string, WpsDialogButtons> onNeedUser = (reason, question, buttons) =>
-            tcs.TrySetResult(CanCloseResponse.NeedUser(reason, question, buttons));
+        Action<NeedUserPayload> onNeedUser = payload =>
+            tcs.TrySetResult(CanCloseResponse.NeedUser(payload));
         Action<string> onRejected = reason => tcs.TrySetResult(CanCloseResponse.Rejected(reason));
 
         _connection.CanCloseOk += onOk;
@@ -265,10 +265,17 @@ public sealed class WpsModuleSlot : IDisposable, IWpsShutdownTarget
     }
 
     /// <inheritdoc cref="IWpsShutdownTarget.SendUserResponseAsync"/>
-    public Task SendUserResponseAsync(WpsDialogResult result)
+    public Task SendUserResponseAsync(string buttonId)
     {
         if (_disposed || _connection is null) return Task.CompletedTask;
-        return _connection.SendUserResponseAsync(result);
+        return _connection.SendUserResponseAsync(buttonId);
+    }
+
+    /// <inheritdoc cref="IWpsShutdownTarget.SendCanCloseCommittedAsync"/>
+    public Task SendCanCloseCommittedAsync()
+    {
+        if (_disposed || _connection is null) return Task.CompletedTask;
+        return _connection.SendCanCloseCommittedAsync();
     }
 
     /// <summary>(v1.3) Phase finale : envoie CLOSE, attend CLOSING_DONE OU Process.Exited
@@ -378,8 +385,8 @@ public sealed class WpsModuleSlot : IDisposable, IWpsShutdownTarget
         // module avance (BUSY_PROGRESS et CAN_CLOSE_BUSY répété qui fait reset du watchdog).
         Action onOk = () => tcs.TrySetResult(CanCloseResponse.Ok);
         Action<int, string> onBusyAgain = (_, _) => lastSignalUtc = DateTime.UtcNow;
-        Action<string, string, WpsDialogButtons> onNeedUser = (reason, question, buttons) =>
-            tcs.TrySetResult(CanCloseResponse.NeedUser(reason, question, buttons));
+        Action<NeedUserPayload> onNeedUser = payload =>
+            tcs.TrySetResult(CanCloseResponse.NeedUser(payload));
         Action<string> onRejected = reason => tcs.TrySetResult(CanCloseResponse.Rejected(reason));
         Action<int, string> onProgress = (_, _) => lastSignalUtc = DateTime.UtcNow;
         Action onProcessExited = () => tcs.TrySetResult(CanCloseResponse.Timeout);
@@ -518,7 +525,7 @@ public sealed class WpsModuleSlot : IDisposable, IWpsShutdownTarget
                 // Pas de UI ici — on traite comme Timeout (Kill direct). L'orchestrateur ne devrait
                 // pas appeler ShutdownAsync sur un module qui peut faire NeedUser, mais si ça
                 // arrive (call site simple), on ne bloque pas.
-                WpsDebugSender.Log($"ShutdownAsync: NeedUser ({needUser.Reason}) reçu hors orchestrateur → Kill",
+                WpsDebugSender.Log($"ShutdownAsync: NeedUser ({needUser.Payload.Reason}) reçu hors orchestrateur → Kill",
                     LogLevel.Warning, LogTag);
                 if (opts.KillFallback) try { _process.Kill(true); } catch { }
                 _disposed = true;

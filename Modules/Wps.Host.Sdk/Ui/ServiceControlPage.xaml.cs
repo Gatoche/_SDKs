@@ -162,7 +162,14 @@ public partial class ServiceControlPage : UserControl
 
     private void RefreshStatus()
     {
-        bool running = _client?.Process is { HasExited: false };
+        // Le timer tick toutes les 1s. Pendant la fermeture du service, le Process peut être
+        // déjà Dispose() côté WpsModuleServiceClient (DisposeUnmanaged) — la référence
+        // _client.Process reste non-null mais .HasExited lève InvalidOperationException
+        // ("No process is associated with this object"). On considère ce cas comme "not
+        // running" sans laisser remonter l'exception.
+        bool running;
+        try { running = _client?.Process is { HasExited: false }; }
+        catch (InvalidOperationException) { running = false; }
         bool ready = _client?.IsReady == true;
         if (running && ready)
         {
@@ -228,6 +235,13 @@ public partial class ServiceControlPage : UserControl
         }
         return c;
     }
+
+    /// <summary>(v1.3 final) Lecture pure de la référence au client sans la nullifier côté
+    /// page (contrairement à <see cref="DetachClient"/>). Utile quand un caller a besoin
+    /// d'opérer sur le client (ex : orchestrateur de shutdown qui collecte les targets) sans
+    /// pour autant priver la pageslot de sa référence — si l'opération est annulée, la
+    /// page continue à fonctionner normalement.</summary>
+    public WpsModuleServiceClient? PeekClient() => _client;
 
     private async void OnSettingsClick(object sender, RoutedEventArgs e)
     {

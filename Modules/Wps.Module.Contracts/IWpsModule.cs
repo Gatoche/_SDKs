@@ -66,6 +66,49 @@ public interface IWpsModule
     /// </summary>
     void OnCanCloseAborted() { }
 
+    /// <summary>(v1.3 final) L'orchestrateur côté host a validé qu'on va effectivement
+    /// fermer (toutes les NeedUser ont dit Oui, aucun Rejected en cascade). C'est le signal
+    /// pour les modules en état Busy de démarrer leur travail réel (cleanup applicatif,
+    /// désenregistrement AppBar, etc.). À ne PAS faire dans
+    /// <see cref="OnCanCloseRequestedAsync"/> : un Rejected/No tardif d'un autre module
+    /// peut encore annuler la fermeture, et un cleanup partiel laisserait le module en
+    /// état dégradé sans retour possible.
+    /// <para>L'app y lance typiquement son travail asynchrone (fire-and-forget vers une
+    /// méthode async qui finit par appeler <c>WpsModule.ResolveCanClose(Ok)</c>). DIM par
+    /// défaut vide : pour un module sans travail Busy (Ok direct), aucune action requise.</para>
+    /// <para>Appelée uniquement pour les modules en état Busy (issus d'un retour
+    /// <c>CanCloseDecision.Busy(...)</c> en Phase 1, ou d'un id custom mappé en Busy via
+    /// <see cref="OnUserResponseAsync"/>). Les Ok purs ferment direct sans passer ici.</para>
+    /// </summary>
+    ValueTask OnCanCloseCommittedAsync() => default;
+
+    /// <summary>(v1.3 final) L'utilisateur a cliqué sur un bouton de la modale NeedUser
+    /// affichée côté host. Permet à l'app de mapper l'id du bouton vers la décision finale
+    /// (typiquement pour des ids custom non-réservés comme <c>"yes-after"</c>).
+    /// <para><b>Convention de retour</b> : retourner <c>null</c> signifie "utilise le mapping
+    /// standard du SDK" (ids réservés <c>yes</c>/<c>ok</c> → Ok, <c>no</c>/<c>cancel</c> →
+    /// Rejected ; id inconnu → Ok défensif). Retourner une décision explicite (Ok / Busy /
+    /// NeedUser / Rejected) override le mapping standard. Permet de gérer élégamment les ids
+    /// custom :</para>
+    /// <code>
+    /// public ValueTask&lt;CanCloseDecision?&gt; OnUserResponseAsync(string buttonId)
+    /// {
+    ///     // "yes-after" : on accepte la fermeture mais on a un cleanup long → Busy
+    ///     if (buttonId == "yes-after")
+    ///     {
+    ///         _ = SaveAndResolveAsync();  // fire-and-forget, fait ResolveCanClose(Ok) à la fin
+    ///         return new ValueTask&lt;CanCloseDecision?&gt;(
+    ///             CanCloseDecision.Busy("Sauvegarde en cours...", 5000));
+    ///     }
+    ///     // "yes" et "no" : mapping standard suffit
+    ///     return default;
+    /// }
+    /// </code>
+    /// <para>DIM par défaut retourne <c>null</c> → mapping standard pour tous les ids.</para>
+    /// </summary>
+    ValueTask<CanCloseDecision?> OnUserResponseAsync(string buttonId)
+        => new((CanCloseDecision?)null);
+
     /// <summary>(v1.3) Le host est considéré mort ou figé. Cas détectés :
     /// <list type="bullet">
     ///   <item><see cref="HostDisconnectReason.PipeClosed"/> : le pipe Notif a été coupé

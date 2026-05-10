@@ -110,20 +110,15 @@ internal sealed class WpsModuleConnection : IDisposable
         _duplex.SendAsync(FormattableString.Invariant(
             $"{WpsModuleContract.NotifCanCloseBusy}{WpsModuleContract.Separator}{estimatedMs}{WpsModuleContract.Separator}{reason ?? ""}"));
 
-    /// <summary>(v1.3) Envoie CAN_CLOSE_NEED_USER|reason|question|buttons. Le HOST affiche
-    /// la modale (pas le module) — le module ne fait que déclarer ce qu'il faut demander.
-    /// Le résultat revient via <see cref="WpsModuleContract.CmdUserResponse"/> que le
-    /// négociateur mappe automatiquement en Ok ou Rejected.
-    /// <para><c>reason</c> et <c>question</c> sont encodés via
-    /// <see cref="WpsModuleContract.EncodeLineSafe"/> : les newlines (\n, \r) deviennent un
-    /// caractère US (U+001E) pour ne pas casser le pipe line-delimited. Le host décode au
-    /// parsing.</para></summary>
-    public Task SendCanCloseNeedUserAsync(string reason, string question, WpsDialogButtons buttons) =>
+    /// <summary>(v1.3 final) Envoie <c>CAN_CLOSE_NEED_USER|jsonPayload</c>. Le HOST affiche
+    /// la modale (pas le module) — le module ne fait que déclarer la question + les boutons
+    /// via <see cref="NeedUserPayload"/>. Le résultat revient via
+    /// <see cref="WpsModuleContract.CmdUserResponse"/> que le négociateur mappe en Ok ou
+    /// Rejected pour les ids réservés (yes/ok/no/cancel) — pour les ids custom, l'app
+    /// override via <see cref="IWpsModule.OnUserResponseAsync"/>.</summary>
+    public Task SendCanCloseNeedUserAsync(NeedUserPayload payload) =>
         _duplex.SendAsync(
-            $"{WpsModuleContract.NotifCanCloseNeedUser}{WpsModuleContract.Separator}" +
-            $"{WpsModuleContract.EncodeLineSafe(reason)}{WpsModuleContract.Separator}" +
-            $"{WpsModuleContract.EncodeLineSafe(question)}{WpsModuleContract.Separator}" +
-            $"{buttons}");
+            $"{WpsModuleContract.NotifCanCloseNeedUser}{WpsModuleContract.Separator}{payload.Serialize()}");
 
     /// <summary>(v1.3) Envoie CAN_CLOSE_REJECTED|reason. Le host annule sa fermeture en cascade.</summary>
     public Task SendCanCloseRejectedAsync(string reason) =>
@@ -206,17 +201,18 @@ internal sealed class WpsModuleConnection : IDisposable
                 break;
 
             case WpsModuleContract.CmdUserResponse when parts.Length >= 2:
-                // Format : USER_RESPONSE|result (où result ∈ Yes/No/Cancel/Ok)
-                if (Enum.TryParse<WpsDialogResult>(parts[1], ignoreCase: false, out var dialogResult))
-                {
-                    _negotiator?.OnUserResponseReceived(dialogResult);
-                }
-                else
-                {
-                    WpsDebugSender.Log(
-                        $"USER_RESPONSE: result inconnu '{parts[1]}' — ignoré (cycle restera bloqué jusqu'au timeout)",
-                        LogLevel.Warning, LogTag);
-                }
+                // Format v1.3 final : USER_RESPONSE|buttonId (string libre, défini par l'app
+                // via le dictionnaire answers du NeedUserPayload). Le négociateur mappe les
+                // ids réservés (yes/ok/no/cancel) en standard, et délègue à l'app via la DIM
+                // OnUserResponseAsync pour les ids custom.
+                _ = _negotiator?.OnUserResponseReceived(parts[1]);
+                break;
+
+            case WpsModuleContract.CmdCanCloseCommitted:
+                // (v1.3 final) Signal de validation globale : toutes les NeedUser ont dit Oui,
+                // l'orchestrateur va attendre les Busy. C'est ICI que le module Busy démarre
+                // son travail réel (via la DIM OnCanCloseCommittedAsync).
+                _ = _negotiator?.OnCanCloseCommittedReceived();
                 break;
         }
     }

@@ -123,12 +123,51 @@ internal sealed class WpsModuleServiceShutdownNegotiator
         await ApplyDecisionAsync(decision).ConfigureAwait(false);
     }
 
+    /// <summary>(v1.3 final) CAN_CLOSE_COMMITTED reçu — signal que la fermeture est validée
+    /// globalement. Déclenche la DIM <see cref="IWpsModule.OnCanCloseCommittedAsync"/> où
+    /// l'app démarre son travail Busy réel. Marshall conditionnel UI thread (cohérent avec
+    /// les autres hooks ModuleService — WPF ou console pure).</summary>
+    public async Task OnCanCloseCommittedReceived()
+    {
+        var module = Module;
+        if (module is null) return;
+        try
+        {
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher is null || dispatcher.CheckAccess())
+            {
+                await module.OnCanCloseCommittedAsync().ConfigureAwait(false);
+            }
+            else
+            {
+                var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _ = dispatcher.BeginInvoke(new Action(async () =>
+                {
+                    try { await module.OnCanCloseCommittedAsync().ConfigureAwait(false); }
+                    catch (Exception ex)
+                    {
+                        WpsDebugSender.Log(
+                            $"OnCanCloseCommittedAsync threw {ex.GetType().Name}: {ex.Message}",
+                            LogLevel.Warning, LogTag);
+                    }
+                    finally { tcs.TrySetResult(true); }
+                }));
+                await tcs.Task.ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            WpsDebugSender.Log(
+                $"OnCanCloseCommittedReceived marshalling threw {ex.GetType().Name}: {ex.Message}",
+                LogLevel.Warning, LogTag);
+        }
+    }
+
     /// <summary>(v1.3 final) USER_RESPONSE reçu après que la modale host a été tranchée par
-    /// l'utilisateur. Mapping standard : Yes/Ok → CanCloseDecision.Ok, No/Cancel → Rejected.
-    /// L'app peut court-circuiter en appelant <see cref="WpsModuleService.ResolveCanClose"/>
-    /// avant que USER_RESPONSE n'arrive (cas custom rare) — on vérifie l'état pour ne pas
-    /// écraser une résolution applicative.</summary>
-    public Task OnUserResponseReceived(WpsDialogResult result)
+    /// l'utilisateur. Pipeline : appel DIM <see cref="IWpsModule.OnUserResponseAsync"/>
+    /// (retour <c>null</c> = fallback standard), sinon mapping standard yes/ok → Ok,
+    /// no/cancel → Rejected.</summary>
+    public async Task OnUserResponseReceived(string buttonId)
     {
         lock (_lock)
         {
@@ -137,22 +176,68 @@ internal sealed class WpsModuleServiceShutdownNegotiator
                 WpsDebugSender.Log(
                     $"OnUserResponseReceived ignoré : état={_state} (attendu NeedUser, peut-être déjà résolu par l'app)",
                     LogLevel.Trace, LogTag);
-                return Task.CompletedTask;
+                return;
             }
         }
 
-        var decision = result switch
+        // 1. Tentative de mapping applicatif via DIM. Null = fallback standard.
+        CanCloseDecision? appDecision = null;
+        var module = Module;
+        if (module is not null)
         {
-            WpsDialogResult.Yes or WpsDialogResult.Ok => CanCloseDecision.Ok,
-            WpsDialogResult.No => CanCloseDecision.Rejected("user-no"),
-            WpsDialogResult.Cancel => CanCloseDecision.Rejected("user-cancel"),
-            _ => CanCloseDecision.Ok,
-        };
+            try
+            {
+                var dispatcher = Application.Current?.Dispatcher;
+                if (dispatcher is null || dispatcher.CheckAccess())
+                {
+                    appDecision = await module.OnUserResponseAsync(buttonId).ConfigureAwait(false);
+                }
+                else
+                {
+                    var tcs = new TaskCompletionSource<CanCloseDecision?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _ = dispatcher.BeginInvoke(new Action(async () =>
+                    {
+                        try
+                        {
+                            var d = await module.OnUserResponseAsync(buttonId).ConfigureAwait(false);
+                            tcs.TrySetResult(d);
+                        }
+                        catch (Exception ex)
+                        {
+                            WpsDebugSender.Log(
+                                $"OnUserResponseAsync('{buttonId}') threw {ex.GetType().Name}: {ex.Message} — fallback standard mapping",
+                                LogLevel.Warning, LogTag);
+                            tcs.TrySetResult(null);
+                        }
+                    }));
+                    appDecision = await tcs.Task.ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                WpsDebugSender.Log(
+                    $"OnUserResponseAsync marshalling threw {ex.GetType().Name}: {ex.Message}",
+                    LogLevel.Warning, LogTag);
+            }
+        }
+
+        // 2. Fallback mapping standard si l'app n'a pas override.
+        var decision = appDecision ?? StandardMapping(buttonId);
         WpsDebugSender.Log(
-            $"USER_RESPONSE reçu ({result}) → {decision.GetType().Name}",
+            $"USER_RESPONSE reçu ('{buttonId}') → {decision.GetType().Name} ({(appDecision is not null ? "app override" : "standard mapping")})",
             LogLevel.Info, LogTag);
-        return ApplyDecisionAsync(decision);
+        await ApplyDecisionAsync(decision).ConfigureAwait(false);
     }
+
+    /// <summary>Mapping standard pour les ids réservés. Les autres tombent sur Ok défensif —
+    /// l'app aurait dû override via <see cref="IWpsModule.OnUserResponseAsync"/>.</summary>
+    private static CanCloseDecision StandardMapping(string buttonId) => buttonId switch
+    {
+        "yes" or "ok" => CanCloseDecision.Ok,
+        "no" => CanCloseDecision.Rejected("user-no"),
+        "cancel" => CanCloseDecision.Rejected("user-cancel"),
+        _ => CanCloseDecision.Ok,
+    };
 
     /// <summary>CAN_CLOSE_ABORTED reçu : libère le verrou Locked → Idle, notifie l'app.</summary>
     public void OnCanCloseAborted()
@@ -299,10 +384,16 @@ internal sealed class WpsModuleServiceShutdownNegotiator
 
             case CanCloseDecision.NeedUserD needUser:
                 lock (_lock) _state = State.NeedUser;
-                await _connection.SendCanCloseNeedUserAsync(needUser.Reason, needUser.Question, needUser.Buttons)
-                    .ConfigureAwait(false);
+                var payload = new NeedUserPayload
+                {
+                    Reason = needUser.Reason,
+                    Ask = needUser.Question,
+                    Answers = new Dictionary<string, string>(needUser.Answers),
+                    AllowClose = needUser.AllowClose,
+                };
+                await _connection.SendCanCloseNeedUserAsync(payload).ConfigureAwait(false);
                 WpsDebugSender.Log(
-                    $"CAN_CLOSE_NEED_USER sent (reason='{needUser.Reason}', question='{needUser.Question}', buttons={needUser.Buttons}) — host will display the modal",
+                    $"CAN_CLOSE_NEED_USER sent (reason='{needUser.Reason}', answers=[{string.Join(",", needUser.Answers.Keys)}], allowClose={needUser.AllowClose}) — host will display the modal",
                     LogLevel.Trace, LogTag);
                 break;
 

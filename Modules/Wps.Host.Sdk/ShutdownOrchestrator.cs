@@ -58,12 +58,13 @@ public sealed class ShutdownOrchestrator
     /// <param name="opts">Options de fermeture (timeouts, mode urgent, etc.).</param>
     /// <param name="onShowUserDialog">Callback invoqué (sur le UI thread du host) pour afficher
     /// la modale de confirmation côté HOST quand un target répond NEED_USER. Reçoit
-    /// <c>(target, reason, question, buttons)</c> et doit retourner la
-    /// <see cref="WpsDialogResult"/> choisie par l'utilisateur. L'orchestrateur transmet ensuite
-    /// le résultat au module via <c>USER_RESPONSE</c>, qui est mappé automatiquement par le SDK
-    /// module en CAN_CLOSE_OK (Yes/Ok) ou CAN_CLOSE_REJECTED (No/Cancel). Le host est libre de
-    /// faire un switch onglet vers le target en plus de l'affichage de la modale, pour le
-    /// contexte visuel.</param>
+    /// <c>(target, payload)</c> où le payload contient <c>reason</c>, <c>ask</c>,
+    /// <c>answers</c> dict (id → label) et <c>allowClose</c>. Doit retourner l'id (string) du
+    /// bouton cliqué par l'utilisateur. L'orchestrateur transmet cet id au module via
+    /// <c>USER_RESPONSE</c> ; le SDK module appelle la DIM <c>OnUserResponseAsync</c> (override
+    /// applicatif) puis tombe sur le mapping standard pour les ids réservés (yes/ok → Ok,
+    /// no/cancel → Rejected). Le host est libre de faire un switch onglet vers le target en
+    /// plus de l'affichage de la modale, pour le contexte visuel.</param>
     /// <param name="progress">Optionnel : reçoit des mises à jour de progression pendant la
     /// séquence (target en cours, état, message). Utile pour un overlay UI dans le host.</param>
     /// <param name="ct">Cancellation pour annuler la séquence (ex: l'utilisateur annule la
@@ -76,7 +77,7 @@ public sealed class ShutdownOrchestrator
     /// Si null, pas de capture — comportement default.</param>
     public async Task<HostShutdownOutcome> ExecuteAsync(
         ShutdownOptions opts,
-        Func<IWpsShutdownTarget, string, string, WpsDialogButtons, Task<WpsDialogResult>> onShowUserDialog,
+        Func<IWpsShutdownTarget, NeedUserPayload, Task<string>> onShowUserDialog,
         IProgress<ShutdownProgress>? progress = null,
         CancellationToken ct = default,
         Func<IWpsShutdownTarget, Task>? onBeforeTargetClose = null)
@@ -145,11 +146,18 @@ public sealed class ShutdownOrchestrator
         }
 
         // ====== Phase 3 : queue NEED_USER séquentielle (modale affichée HOST-side) ======
-        // Architecture v1.3 final : le host affiche la modale, pas le module. L'orchestrateur
-        // appelle onShowUserDialog → reçoit WpsDialogResult → envoie USER_RESPONSE au module
-        // (mappage automatique Yes/Ok→Ok, No/Cancel→Rejected côté SDK module). On attend ensuite
-        // la résolution effective via WaitForNeedUserResolutionAsync (qui voit arriver le
-        // CAN_CLOSE_OK ou CAN_CLOSE_REJECTED après que le négociateur module ait appliqué).
+        // Le host affiche la modale custom (boutons dynamiques depuis answers fourni par le
+        // module). onShowUserDialog → id du bouton cliqué → USER_RESPONSE → DIM
+        // OnUserResponseAsync (override applicatif pour ids custom comme "yes-after") puis
+        // fallback mapping standard (yes/ok → Ok, no/cancel → Rejected). Résolution effective
+        // via WaitForNeedUserResolutionAsync. Si yes-after → Busy → rejoint la liste des
+        // Busy à committer juste après Phase 3.
+        //
+        // ⚠️ Architecture critique : les modules Busy NE démarrent PAS leur travail dès leur
+        // réponse à CAN_CLOSE. Ils attendent un signal CAN_CLOSE_COMMITTED envoyé après que
+        // toutes les NeedUser aient dit Oui. Sans ça, un Non tardif sur une modale annulerait
+        // la fermeture mais les Busy auraient déjà commencé leur cleanup → état applicatif
+        // dégradé sans retour possible.
         var needUsers = canCloseResults
             .Where(kv => kv.Value is CanCloseResponse.NeedUserR)
             .Select(kv => (Target: kv.Key, NeedUser: (CanCloseResponse.NeedUserR)kv.Value))
@@ -157,33 +165,33 @@ public sealed class ShutdownOrchestrator
         foreach (var (target, nu) in needUsers)
         {
             ct.ThrowIfCancellationRequested();
+            var payload = nu.Payload;
             WpsDebugSender.Log(
-                $"Phase 3: '{target.Name}' NeedUser (reason='{nu.Reason}', question='{nu.Question}', buttons={nu.Buttons}) — host displays modal",
+                $"Phase 3: '{target.Name}' NeedUser (reason='{payload.Reason}', answers=[{string.Join(",", payload.Answers.Keys)}], allowClose={payload.AllowClose}) — host displays modal",
                 LogLevel.Info, LogTag);
-            progress?.Report(new ShutdownProgress(target, ShutdownPhase.UserInteraction, nu.Reason));
+            progress?.Report(new ShutdownProgress(target, ShutdownPhase.UserInteraction, payload.Reason));
 
-            // 1. Affichage de la modale côté host (callback → résultat utilisateur)
-            WpsDialogResult dialogResult;
+            // 1. Affichage de la modale côté host (callback → id du bouton cliqué)
+            string buttonId;
             try
             {
-                dialogResult = await onShowUserDialog(target, nu.Reason, nu.Question, nu.Buttons)
-                    .ConfigureAwait(false);
+                buttonId = await onShowUserDialog(target, payload).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 WpsDebugSender.Log(
-                    $"Phase 3: onShowUserDialog('{target.Name}') threw {ex.GetType().Name}: {ex.Message} — fallback Cancel (Rejected)",
+                    $"Phase 3: onShowUserDialog('{target.Name}') threw {ex.GetType().Name}: {ex.Message} — fallback id 'cancel' (Rejected via mapping standard)",
                     LogLevel.Warning, LogTag);
-                dialogResult = WpsDialogResult.Cancel;
+                buttonId = "cancel";
             }
             WpsDebugSender.Log(
-                $"Phase 3: '{target.Name}' user clicked {dialogResult} → SendUserResponseAsync",
+                $"Phase 3: '{target.Name}' user clicked '{buttonId}' → SendUserResponseAsync",
                 LogLevel.Trace, LogTag);
 
-            // 2. Envoi USER_RESPONSE au module — qui appliquera Ok ou Rejected via son négociateur
+            // 2. Envoi USER_RESPONSE au module
             try
             {
-                await target.SendUserResponseAsync(dialogResult).ConfigureAwait(false);
+                await target.SendUserResponseAsync(buttonId).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -192,11 +200,9 @@ public sealed class ShutdownOrchestrator
                     LogLevel.Warning, LogTag);
             }
 
-            // 3. Attendre la résolution effective (CAN_CLOSE_OK ou CAN_CLOSE_REJECTED arrivant
-            // du module après son traitement du USER_RESPONSE). WaitForNeedUserResolutionAsync
-            // n'a pas de watchdog silence (cf. doc).
+            // 3. Attendre la résolution effective (Ok / Busy / Rejected).
             var followup = await target.WaitForNeedUserResolutionAsync(opts, ct).ConfigureAwait(false);
-            canCloseResults[target] = followup;
+            lock (canCloseResults) canCloseResults[target] = followup;
 
             if (followup is CanCloseResponse.RejectedR rej)
             {
@@ -212,24 +218,57 @@ public sealed class ShutdownOrchestrator
                 await Task.WhenAll(lockedAfter.Select(t => t.SendCanCloseAbortedAsync())).ConfigureAwait(false);
                 return HostShutdownOutcome.AbortedByModule;
             }
+            // Si followup BusyR (yes-after par ex.), le target rejoint naturellement la liste
+            // des Busy ci-dessous via canCloseResults — il recevra son CAN_CLOSE_COMMITTED.
         }
 
-        // ====== Phase 4 : synchronisation des Busy (attente passage en Ok) ======
-        // Les Busy doivent passer en Ok via un autre cycle (le module appelle ResolveCanClose
-        // de son côté, ou ses BUSY_PROGRESS finissent par cesser et ResolveCanClose(Ok) arrive).
-        // On utilise WaitForBusyResolutionAsync qui s'abonne aux events CanCloseOk /
-        // CanCloseNeedUser / CanCloseRejected / BusyProgressReceived sans envoyer de nouveau
-        // CAN_CLOSE — pure écoute. Le fix d'un bug initial : un re-poll naïf renvoyait
-        // immédiatement Busy via le coalesce côté module, et l'orchestrateur enchaînait alors
-        // sur Phase 5 (CLOSE) sans respecter le travail en cours.
-        var stillBusy = canCloseResults
+        // ====== Phase 3.5 : envoi CAN_CLOSE_COMMITTED à tous les Busy ======
+        // Validation globale : toutes les NeedUser ont dit Oui, aucun Rejected en cascade.
+        // C'est ICI seulement que les Busy peuvent commencer leur travail réel. Le SDK module
+        // appelle la DIM OnCanCloseCommittedAsync à réception, l'app y lance son travail
+        // asynchrone et finira par ResolveCanClose(Ok).
+        var busyTargets = canCloseResults
             .Where(kv => kv.Value is CanCloseResponse.BusyR)
             .Select(kv => kv.Key)
             .ToList();
-        if (stillBusy.Count > 0)
+        if (busyTargets.Count > 0)
         {
-            progress?.Report(new ShutdownProgress(null, ShutdownPhase.WaitingBusy, $"{stillBusy.Count} module(s) en cours…"));
-            await Task.WhenAll(stillBusy.Select(async t =>
+            WpsDebugSender.Log(
+                $"Phase 3.5: SendCanCloseCommittedAsync to {busyTargets.Count} Busy target(s) — démarrage travail applicatif",
+                LogLevel.Info, LogTag);
+            await Task.WhenAll(busyTargets.Select(async t =>
+            {
+                try { await t.SendCanCloseCommittedAsync().ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    WpsDebugSender.Log(
+                        $"Phase 3.5: SendCanCloseCommittedAsync('{t.Name}') threw {ex.GetType().Name}: {ex.Message}",
+                        LogLevel.Warning, LogTag);
+                }
+            })).ConfigureAwait(false);
+        }
+
+        // ====== Phase 4 : synchronisation des Busy (attente passage en Ok) ======
+        // Maintenant que les Busy ont reçu COMMITTED et démarrent leur travail, on attend
+        // leur résolution. WaitForBusyResolutionAsync s'abonne aux events CanCloseOk /
+        // CanCloseRejected / CanCloseNeedUser / BusyProgressReceived (heartbeat).
+        if (busyTargets.Count > 0)
+        {
+            // Report avec PendingTargets : le host peut cycler entre les noms ("Fermeture
+            // de X en cours…" toutes les ~1s) plutôt qu'un texte générique.
+            var pendingBusy = new List<IWpsShutdownTarget>(busyTargets);
+            void ReportBusyPending()
+            {
+                IReadOnlyList<IWpsShutdownTarget> snapshot;
+                lock (pendingBusy) snapshot = new List<IWpsShutdownTarget>(pendingBusy);
+                progress?.Report(new ShutdownProgress(
+                    null, ShutdownPhase.WaitingBusy,
+                    $"{snapshot.Count} module(s) en cours…",
+                    snapshot));
+            }
+            ReportBusyPending();
+
+            await Task.WhenAll(busyTargets.Select(async t =>
             {
                 try
                 {
@@ -243,13 +282,15 @@ public sealed class ShutdownOrchestrator
                     WpsDebugSender.Log($"Phase 4: '{t.Name}' WaitForBusyResolutionAsync threw {ex.GetType().Name}: {ex.Message}",
                         LogLevel.Warning, LogTag);
                 }
+                finally
+                {
+                    lock (pendingBusy) pendingBusy.Remove(t);
+                    ReportBusyPending();
+                }
             })).ConfigureAwait(false);
 
-            // Si la résolution de Busy a produit des Rejected, on doit traiter la cascade
-            // comme en phase 2. Les NeedUser tardifs (Busy → NeedUser) ne sont pas typiques
-            // mais possibles ; on les traite comme un Rejected pour simplifier (l'orchestrateur
-            // n'a plus de queue NeedUser à dérouler à ce stade — phase 3 est déjà passée).
-            // Si tu veux supporter Busy → NeedUser, il faudra rajouter une mini queue ici.
+            // Détection Rejected / NeedUser tardifs (cas rares Busy → Rejected ou Busy →
+            // NeedUser). NeedUser tardif traité comme Rejected — la queue Phase 3 est finie.
             var lateRejected = canCloseResults.FirstOrDefault(kv =>
                 kv.Value is CanCloseResponse.RejectedR or CanCloseResponse.NeedUserR);
             if (lateRejected.Key is not null)
@@ -257,7 +298,7 @@ public sealed class ShutdownOrchestrator
                 var reason = lateRejected.Value switch
                 {
                     CanCloseResponse.RejectedR r => r.Reason,
-                    CanCloseResponse.NeedUserR n => $"NeedUser tardif (post-Busy) : {n.Reason}",
+                    CanCloseResponse.NeedUserR n => $"NeedUser tardif (post-Busy) : {n.Payload.Reason}",
                     _ => "?",
                 };
                 WpsDebugSender.Log(
@@ -275,7 +316,21 @@ public sealed class ShutdownOrchestrator
         }
 
         // ====== Phase 5 : envoi CLOSE en parallèle + attente CLOSING_DONE ======
-        progress?.Report(new ShutdownProgress(null, ShutdownPhase.Closing, "Phase finale : CLOSE parallèle"));
+        // (v1.3 final) Report avec PendingTargets : le host peut cycler sur les noms pendant
+        // que les modules ferment ("Fermeture de Demo7.Negotiate en cours…"). Mise à jour à
+        // chaque target qui termine sa fermeture.
+        var allClosingTargets = v13Targets.Concat(legacyTargets).ToList();
+        var pendingClosing = new List<IWpsShutdownTarget>(allClosingTargets);
+        void ReportClosingPending()
+        {
+            IReadOnlyList<IWpsShutdownTarget> snapshot;
+            lock (pendingClosing) snapshot = new List<IWpsShutdownTarget>(pendingClosing);
+            progress?.Report(new ShutdownProgress(
+                null, ShutdownPhase.Closing,
+                $"Phase finale : {snapshot.Count} target(s) à fermer",
+                snapshot));
+        }
+        ReportClosingPending();
 
         // Hook UI : juste avant le CLOSE final, on laisse le host capturer un snapshot du
         // module et parker son HWND. L'utilisateur verra l'image figée du module pendant le
@@ -283,7 +338,6 @@ public sealed class ShutdownOrchestrator
         // tous les targets (v1.3 + legacy) qui vont effectivement être fermés.
         if (onBeforeTargetClose is not null)
         {
-            var allClosingTargets = v13Targets.Concat(legacyTargets).ToList();
             foreach (var t in allClosingTargets)
             {
                 try { await onBeforeTargetClose(t).ConfigureAwait(false); }
@@ -307,6 +361,11 @@ public sealed class ShutdownOrchestrator
                 WpsDebugSender.Log($"Phase 5: '{t.Name}' CompleteShutdownAsync threw {ex.GetType().Name}: {ex.Message}",
                     LogLevel.Warning, LogTag);
             }
+            finally
+            {
+                lock (pendingClosing) pendingClosing.Remove(t);
+                ReportClosingPending();
+            }
         }).ToList();
 
         // ====== Phase 5bis : targets legacy v1.2 traités en parallèle (pas de phase 1-4 pour eux) ======
@@ -325,6 +384,11 @@ public sealed class ShutdownOrchestrator
             {
                 WpsDebugSender.Log($"Phase 5 (legacy): '{t.Name}' threw {ex.GetType().Name}: {ex.Message}",
                     LogLevel.Warning, LogTag);
+            }
+            finally
+            {
+                lock (pendingClosing) pendingClosing.Remove(t);
+                ReportClosingPending();
             }
         }).ToList();
 
@@ -363,7 +427,20 @@ public enum HostShutdownOutcome
 /// <param name="CurrentTarget">Target en cours de traitement, ou null si phase globale.</param>
 /// <param name="Phase">Phase courante de la séquence.</param>
 /// <param name="Message">Texte affichable côté UI.</param>
-public sealed record ShutdownProgress(IWpsShutdownTarget? CurrentTarget, ShutdownPhase Phase, string Message);
+/// <param name="CurrentTarget">Target en cours de traitement, ou null si phase globale.</param>
+/// <param name="Phase">Phase courante de la séquence.</param>
+/// <param name="Message">Texte affichable côté UI (utilisé en fallback si <paramref name="PendingTargets"/>
+/// est vide).</param>
+/// <param name="PendingTargets">(v1.3 final) Pour les phases <see cref="ShutdownPhase.WaitingBusy"/>
+/// et <see cref="ShutdownPhase.Closing"/> : liste des targets encore en attente de résolution.
+/// Permet au host d'afficher leur nom en cycle (toutes les ~1s par exemple) plutôt qu'un
+/// message générique "N module(s) en cours…". Mise à jour à chaque target qui sort de la
+/// liste (résolu / fermé). Vide ou null pour les autres phases.</param>
+public sealed record ShutdownProgress(
+    IWpsShutdownTarget? CurrentTarget,
+    ShutdownPhase Phase,
+    string Message,
+    IReadOnlyList<IWpsShutdownTarget>? PendingTargets = null);
 
 /// <summary>Phase courante de l'orchestrateur, pour la UI host.</summary>
 public enum ShutdownPhase

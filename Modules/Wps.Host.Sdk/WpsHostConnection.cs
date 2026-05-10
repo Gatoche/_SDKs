@@ -48,10 +48,10 @@ internal sealed class WpsHostConnection : IDisposable
     /// <summary>(v1.3) Émis à réception de <c>CAN_CLOSE_BUSY|estimatedMs|reason</c>.</summary>
     public event Action<int, string>? CanCloseBusy;
 
-    /// <summary>(v1.3 final) Émis à réception de <c>CAN_CLOSE_NEED_USER|reason|question|buttons</c>.
-    /// Le HOST est responsable d'afficher la modale et de renvoyer le résultat via
-    /// <see cref="SendUserResponseAsync"/>.</summary>
-    public event Action<string, string, WpsDialogButtons>? CanCloseNeedUser;
+    /// <summary>(v1.3 final) Émis à réception de <c>CAN_CLOSE_NEED_USER|jsonPayload</c>.
+    /// Le HOST est responsable d'afficher la modale (cf. <see cref="NeedUserPayload"/>) et
+    /// de renvoyer l'id du bouton cliqué via <see cref="SendUserResponseAsync"/>.</summary>
+    public event Action<NeedUserPayload>? CanCloseNeedUser;
 
     /// <summary>(v1.3) Émis à réception de <c>CAN_CLOSE_REJECTED|reason</c>.</summary>
     public event Action<string>? CanCloseRejected;
@@ -102,12 +102,20 @@ internal sealed class WpsHostConnection : IDisposable
     public Task SendCanCloseAbortedAsync() =>
         _duplex.SendAsync(WpsModuleContract.CmdCanCloseAborted);
 
-    /// <summary>(v1.3 final) Envoie <c>USER_RESPONSE|result</c> au module en réponse à un
-    /// <see cref="CanCloseNeedUser"/> précédemment reçu. Le négociateur côté module mappe
-    /// <c>Yes</c>/<c>Ok</c> en <c>CAN_CLOSE_OK</c> et <c>No</c>/<c>Cancel</c> en
-    /// <c>CAN_CLOSE_REJECTED</c> automatiquement.</summary>
-    public Task SendUserResponseAsync(WpsDialogResult result) =>
-        _duplex.SendAsync($"{WpsModuleContract.CmdUserResponse}{WpsModuleContract.Separator}{result}");
+    /// <summary>(v1.3 final) Envoie <c>USER_RESPONSE|buttonId</c> au module en réponse à un
+    /// <see cref="CanCloseNeedUser"/> précédemment reçu. L'id est l'une des clés du
+    /// dictionnaire <c>Answers</c> du payload, ou un id réservé (<c>yes</c>/<c>ok</c>/
+    /// <c>no</c>/<c>cancel</c>) si l'app utilise le mapping standard.</summary>
+    public Task SendUserResponseAsync(string buttonId) =>
+        _duplex.SendAsync($"{WpsModuleContract.CmdUserResponse}{WpsModuleContract.Separator}{buttonId ?? ""}");
+
+    /// <summary>(v1.3 final) Envoie <c>CAN_CLOSE_COMMITTED</c> au module : signal de
+    /// validation globale (toutes les NeedUser ont dit Oui). Côté module SDK, déclenche la
+    /// DIM <see cref="IWpsModule.OnCanCloseCommittedAsync"/> où l'app démarre son travail
+    /// Busy réel. À envoyer après Phase 3 (NeedUsers résolues) et avant Phase 4 (await
+    /// résolution Busy).</summary>
+    public Task SendCanCloseCommittedAsync() =>
+        _duplex.SendAsync(WpsModuleContract.CmdCanCloseCommitted);
 
     /// <summary>(v1.2, ModuleService) Envoie INVOKE|requestId|method|jsonParams au peer.
     /// La réponse arrivera asynchrone via <see cref="InvokeResultReceived"/> avec le même
@@ -186,24 +194,21 @@ internal sealed class WpsHostConnection : IDisposable
         }
         if (line.StartsWith(WpsModuleContract.NotifCanCloseNeedUser + WpsModuleContract.Separator, StringComparison.Ordinal))
         {
-            // Format v1.3 final : CAN_CLOSE_NEED_USER|reason|question|buttons (4 parts).
-            // reason et question sont encodés via EncodeLineSafe côté module — on décode ici
-            // pour restituer les \n originaux.
-            var p = line.Split(WpsModuleContract.Separator, 4);
-            if (p.Length >= 4)
+            // Format v1.3 final : CAN_CLOSE_NEED_USER|jsonPayload (2 parts max — le payload
+            // JSON peut contenir des | littéraux, on les préserve via Split(separator, 2)).
+            var p = line.Split(WpsModuleContract.Separator, 2);
+            if (p.Length >= 2)
             {
-                var reason = WpsModuleContract.DecodeLineSafe(p[1]);
-                var question = WpsModuleContract.DecodeLineSafe(p[2]);
-                if (Enum.TryParse<WpsDialogButtons>(p[3], ignoreCase: false, out var buttons))
+                var payload = NeedUserPayload.Deserialize(p[1]);
+                if (payload is not null)
                 {
-                    CanCloseNeedUser?.Invoke(reason, question, buttons);
+                    CanCloseNeedUser?.Invoke(payload);
                 }
                 else
                 {
                     WpsDebugSender.Log(
-                        $"NotifCanCloseNeedUser: buttons inconnu '{p[3]}' — fallback YesNoCancel",
+                        $"NotifCanCloseNeedUser: JSON invalide '{p[1]}' — trame ignorée",
                         LogLevel.Warning, LogTag);
-                    CanCloseNeedUser?.Invoke(reason, question, WpsDialogButtons.YesNoCancel);
                 }
             }
             return;

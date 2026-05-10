@@ -118,17 +118,11 @@ internal sealed class WpsModuleServiceConnection : IDisposable
         _duplex.SendAsync(FormattableString.Invariant(
             $"{WpsModuleContract.NotifCanCloseBusy}{WpsModuleContract.Separator}{estimatedMs}{WpsModuleContract.Separator}{reason ?? ""}"));
 
-    /// <summary>(v1.3 final) Envoie CAN_CLOSE_NEED_USER|reason|question|buttons. Le HOST
-    /// affiche la modale (pas le service) — le service ne fait que déclarer ce qu'il faut
-    /// demander. Le résultat revient via <see cref="WpsModuleContract.CmdUserResponse"/>.
-    /// <c>reason</c> et <c>question</c> sont encodés via <see cref="WpsModuleContract.EncodeLineSafe"/>
-    /// pour supporter les newlines.</summary>
-    public Task SendCanCloseNeedUserAsync(string reason, string question, WpsDialogButtons buttons) =>
+    /// <summary>(v1.3 final) Envoie <c>CAN_CLOSE_NEED_USER|jsonPayload</c>. Le HOST affiche
+    /// la modale (pas le service). Cf. <see cref="NeedUserPayload"/> pour le format.</summary>
+    public Task SendCanCloseNeedUserAsync(NeedUserPayload payload) =>
         _duplex.SendAsync(
-            $"{WpsModuleContract.NotifCanCloseNeedUser}{WpsModuleContract.Separator}" +
-            $"{WpsModuleContract.EncodeLineSafe(reason)}{WpsModuleContract.Separator}" +
-            $"{WpsModuleContract.EncodeLineSafe(question)}{WpsModuleContract.Separator}" +
-            $"{buttons}");
+            $"{WpsModuleContract.NotifCanCloseNeedUser}{WpsModuleContract.Separator}{payload.Serialize()}");
 
     public Task SendCanCloseRejectedAsync(string reason) =>
         _duplex.SendAsync($"{WpsModuleContract.NotifCanCloseRejected}{WpsModuleContract.Separator}{reason ?? ""}");
@@ -209,17 +203,13 @@ internal sealed class WpsModuleServiceConnection : IDisposable
                 break;
 
             case WpsModuleContract.CmdUserResponse when parts.Length >= 2:
-                // Format : USER_RESPONSE|result (où result ∈ Yes/No/Cancel/Ok)
-                if (Enum.TryParse<WpsDialogResult>(parts[1], ignoreCase: false, out var dialogResult))
-                {
-                    _ = _negotiator?.OnUserResponseReceived(dialogResult);
-                }
-                else
-                {
-                    WpsDebugSender.Log(
-                        $"USER_RESPONSE: result inconnu '{parts[1]}' — ignoré (cycle restera bloqué jusqu'au timeout)",
-                        LogLevel.Warning, LogTag);
-                }
+                // Format v1.3 final : USER_RESPONSE|buttonId (string libre).
+                _ = _negotiator?.OnUserResponseReceived(parts[1]);
+                break;
+
+            case WpsModuleContract.CmdCanCloseCommitted:
+                // (v1.3 final) Validation globale → démarrer le travail Busy via la DIM.
+                _ = _negotiator?.OnCanCloseCommittedReceived();
                 break;
         }
     }

@@ -187,17 +187,34 @@ public static class WpsModuleContract
     /// le module n'était pas en état locked, le message est ignoré (idempotent).</para></summary>
     public const string CmdCanCloseAborted = "CAN_CLOSE_ABORTED";
 
-    /// <summary>(v1.3) Résultat de la modale affichée côté HOST en réponse à un
-    /// <see cref="NotifCanCloseNeedUser"/>. Format : <c>USER_RESPONSE|result</c> où
-    /// <c>result</c> est le nom de la valeur <see cref="WpsDialogResult"/> (ex: <c>Yes</c>,
-    /// <c>No</c>, <c>Cancel</c>, <c>Ok</c>).
-    /// <para>Architecture : la modale est affichée par le host (style cohérent + service
-    /// console pure compatible nativement). Le SDK module reçoit ce message et résout
-    /// automatiquement le cycle CAN_CLOSE : <c>Yes</c>/<c>Ok</c> → <c>CAN_CLOSE_OK</c>,
-    /// <c>No</c>/<c>Cancel</c> → <c>CAN_CLOSE_REJECTED</c>. L'app peut hooker via une DIM
-    /// optionnelle pour customiser le mapping (ex: traiter <c>Cancel</c> comme un Busy
-    /// "sauvegarde en cours" plutôt qu'un refus net).</para></summary>
+    /// <summary>(v1.3 final) Résultat de la modale affichée côté HOST en réponse à un
+    /// <see cref="NotifCanCloseNeedUser"/>. Format : <c>USER_RESPONSE|buttonId</c> où
+    /// <c>buttonId</c> est l'une des clés du dictionnaire <c>answers</c> envoyé dans le
+    /// payload NEED_USER (ex: <c>yes</c>, <c>yes-after</c>, <c>no</c>, <c>cancel</c>, etc.).
+    /// <para>Le SDK module mappe automatiquement les ids réservés (<c>yes</c>/<c>ok</c> →
+    /// <c>CAN_CLOSE_OK</c>, <c>no</c>/<c>cancel</c> → <c>CAN_CLOSE_REJECTED</c>) si l'app
+    /// n'override pas via la DIM <see cref="IWpsModule.OnUserResponseAsync"/>. Pour des ids
+    /// custom (<c>yes-after</c>, etc.), l'app DOIT implémenter cette DIM et retourner la
+    /// décision appropriée (typiquement <c>Busy(estMs)</c> pour un "Oui mais après
+    /// traitement").</para></summary>
     public const string CmdUserResponse = "USER_RESPONSE";
+
+    /// <summary>(v1.3 final) Signal de validation globale : l'orchestrateur a confirmé qu'on
+    /// va effectivement fermer (toutes les NeedUser ont dit Oui, aucun Rejected en cascade).
+    /// Envoyé à tous les modules/services en état Busy (initial ou post-yes-after) AVANT que
+    /// l'orchestrateur n'attende leur résolution. Format : <c>CAN_CLOSE_COMMITTED</c> (sans
+    /// payload).
+    /// <para><b>Pourquoi ce signal :</b> sans lui, un module Busy commencerait son travail
+    /// (cleanup applicatif partiel, désenregistrement AppBar, etc.) DÈS sa réponse à
+    /// <c>CAN_CLOSE</c> en Phase 1. Si une modale NeedUser d'un AUTRE module dit Non plus
+    /// tard, l'orchestrateur cascade abort — mais le travail Busy a déjà commencé, l'état
+    /// applicatif est dégradé sans retour possible. Avec ce signal, le module retourne
+    /// <c>Busy(estMs)</c> en Phase 1 SANS rien lancer, et démarre son travail uniquement à
+    /// réception de <c>CAN_CLOSE_COMMITTED</c> via la DIM <see cref="IWpsModule.OnCanCloseCommittedAsync"/>.</para>
+    /// <para>Côté SDK module : la réception déclenche l'appel de cette DIM ; l'app y lance
+    /// son travail asynchrone et finit par appeler <c>WpsModule.ResolveCanClose(Ok)</c>
+    /// comme avant.</para></summary>
+    public const string CmdCanCloseCommitted = "CAN_CLOSE_COMMITTED";
 
     // ====== Vocabulaire v1.3 Module → Host ======
 
@@ -219,26 +236,34 @@ public static class WpsModuleContract
     /// la dernière portion de trame, reconstruite via string.Join côté parser).</summary>
     public const string NotifCanCloseBusy = "CAN_CLOSE_BUSY";
 
-    /// <summary>(v1.3) Réponse NEED_USER au CAN_CLOSE : le module a besoin d'une confirmation
-    /// utilisateur. Le HOST affiche la modale (pas le module) — le module ne fait que
-    /// déclarer la <c>question</c> et les <c>buttons</c> ; le host appelle MessageBox.Show
-    /// dans son propre process et renvoie le résultat via <see cref="CmdUserResponse"/>.
-    /// <para>Format : <c>CAN_CLOSE_NEED_USER|reason|question|buttons</c> où :</para>
+    /// <summary>(v1.3 final) Réponse NEED_USER au CAN_CLOSE : le module a besoin d'une
+    /// confirmation utilisateur. Le HOST affiche la modale (pas le module) — le module
+    /// déclare la question + les boutons via un payload JSON ; le host affiche sa dialog
+    /// custom, l'utilisateur clique un bouton, le host renvoie l'id du bouton via
+    /// <see cref="CmdUserResponse"/>.
+    /// <para>Format : <c>CAN_CLOSE_NEED_USER|jsonPayload</c> où <c>jsonPayload</c> est sérialisé
+    /// par <see cref="SerializeNeedUserPayload"/> et a la forme :</para>
+    /// <code>
+    /// {
+    ///   "reason": "Document non sauvegardé",
+    ///   "ask": "Voulez-vous fermer ?",
+    ///   "answers": { "yes": "Oui", "yes-after": "Oui après traitement", "no": "Non" },
+    ///   "allowClose": false
+    /// }
+    /// </code>
     /// <list type="bullet">
-    ///   <item><c>reason</c> : sous-titre / contexte (ex: "Document non sauvegardé"). Utilisé
-    ///         dans le titre de la modale ou en zone détails côté host.</item>
-    ///   <item><c>question</c> : question principale affichée à l'utilisateur (ex: "Voulez-
-    ///         vous fermer sans sauvegarder ?").</item>
-    ///   <item><c>buttons</c> : nom de la valeur <see cref="WpsDialogButtons"/> (ex:
-    ///         <c>YesNoCancel</c>, <c>OkCancel</c>).</item>
+    ///   <item><c>reason</c> : sous-titre / contexte affiché côté host (ex: titre de la modale).</item>
+    ///   <item><c>ask</c> : question principale affichée à l'utilisateur.</item>
+    ///   <item><c>answers</c> : dictionnaire ordonné <c>id → label</c>. L'ordre d'insertion
+    ///         est préservé (Dictionary&lt;,&gt; .NET 6+) et utilisé pour l'ordre d'affichage
+    ///         des boutons. Le 1er est le bouton par défaut (Enter).</item>
+    ///   <item><c>allowClose</c> : si <c>false</c>, la croix de fermeture et Esc sont
+    ///         neutralisés — l'utilisateur DOIT cliquer un bouton.</item>
     /// </list>
-    /// <para><c>question</c> ne peut pas contenir de <c>|</c> littéral — utiliser un escape
-    /// applicatif si nécessaire (typiquement les questions courantes n'en contiennent pas).
-    /// <c>reason</c> et <c>buttons</c> sont strictement contraints (textes courts / enum).</para>
-    /// <para><b>Avantages</b> de l'affichage host-side : (1) services console pures
-    /// compatibles sans Application WPF, (2) pas de focus war cross-process (modale dans
-    /// le même process que le host), (3) style cohérent host, (4) sérialisation auto
-    /// quand N modules répondent NeedUser.</para>
+    /// <para>Le JSON est sérialisé avec System.Text.Json et placé sur une seule ligne du
+    /// wire. Les <c>|</c> qui pourraient apparaître dans le payload JSON ne posent pas de
+    /// problème car la trame n'a que 2 champs (<c>NotifCanCloseNeedUser|reste</c>) et on
+    /// utilise <c>Split(Separator, 2)</c> côté parsing.</para>
     /// <para>Si <c>isUrgent=1</c> dans le CAN_CLOSE entrant, le SDK module clamp NeedUser
     /// en Busy automatiquement — pas de dialog pendant un shutdown OS.</para></summary>
     public const string NotifCanCloseNeedUser = "CAN_CLOSE_NEED_USER";
