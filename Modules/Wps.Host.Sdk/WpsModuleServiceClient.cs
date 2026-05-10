@@ -358,8 +358,9 @@ public sealed class WpsModuleServiceClient : IDisposable, IWpsShutdownTarget
 
             var processExitTask = _process.WaitForExitAsync(cts.Token);
             var first = await Task.WhenAny(closingDoneTcs.Task, processExitTask).ConfigureAwait(false);
+            var closingDoneObserved = first == closingDoneTcs.Task;
 
-            if (first == closingDoneTcs.Task && !_process.HasExited)
+            if (closingDoneObserved && !_process.HasExited)
             {
                 using var shortCts = new CancellationTokenSource(2000);
                 try { await _process.WaitForExitAsync(shortCts.Token).ConfigureAwait(false); }
@@ -376,9 +377,15 @@ public sealed class WpsModuleServiceClient : IDisposable, IWpsShutdownTarget
                 return ShutdownResult.Completed;
             }
 
+            // Timeout : Kill fallback. Le message diffère selon que CLOSING_DONE a été reçu ou
+            // pas — sinon on affiche "grace expired (Xms)" alors que le timeout réel est de 2s
+            // (shortCts post-CLOSING_DONE), ce qui est trompeur en lecture de logs.
             if (opts.KillFallback)
             {
-                WpsDebugSender.Log($"CompleteShutdownAsync [{sidShort}]: grace expired ({opts.CleanupGracePeriodMs}ms) → Kill(true)",
+                var reason = closingDoneObserved
+                    ? "post-CLOSING_DONE shortCts expired (2000ms, process traînant à exit)"
+                    : $"grace expired ({opts.CleanupGracePeriodMs}ms, ni CLOSING_DONE ni exit)";
+                WpsDebugSender.Log($"CompleteShutdownAsync [{sidShort}]: {reason} → Kill(true)",
                     LogLevel.Warning, LogTag);
                 try { _process.Kill(true); }
                 catch (Exception ex)
