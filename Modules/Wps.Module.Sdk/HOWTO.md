@@ -43,7 +43,38 @@ Ajouter la référence SDK + l'import des targets unifiés :
 <Import Project="..\..\..\_SDKs\Modules\Wps.Module.Sdk\Wps.Module.Sdk.targets" />
 ```
 
-### 2. `Description.md` embarqué
+### 2. Stockage des données — convention wipiSoft
+
+Toute donnée hors-registre du module (cache, fichiers générés, settings JSON,
+WebView2 user data, extractions...) doit aller dans :
+
+```
+<RépertoireWipiSoft>\Data\<WipiModuleName>\        (par défaut C:\_wipiSoft\Data\<Name>\)
+```
+
+Source-link `WpsPaths.cs` dans le csproj :
+
+```xml
+<Compile Include="..\..\..\_libs\WpsPaths.cs" Link="Helpers\WpsPaths.cs" />
+```
+
+Et utilise-le partout où tu écris :
+
+```csharp
+var dataDir   = wipisoft.WpsPaths.GetAppDataDir("MonModule");
+var cacheDir  = wipisoft.WpsPaths.GetAppDataSubDir("MonModule", "cache");
+var wv2Folder = wipisoft.WpsPaths.GetAppDataSubDir("MonModule", "WebView2");
+```
+
+> **Pourquoi pas `%LOCALAPPDATA%` ?** Par-utilisateur, invisible aux outils host
+> (wipiManager), impossible à inventorier/sauvegarder en bloc. La convention
+> wipiSoft regroupe tout sous une seule racine machine. Cf. en-tête de
+> `_libs/WpsPaths.cs`.
+>
+> Pour les vrais secrets utilisateur, continuer à utiliser HKCU
+> (`WpsHKCU` dans `_libs/`).
+
+### 3. `Description.md` embarqué
 
 Crée un `Description.md` à la racine du projet (titre court, méthodes exposées, persistance HKCU,
 etc.) puis :
@@ -56,7 +87,7 @@ etc.) puis :
 
 Lu côté host par `WpsModuleMetadata` → affiché dans la pageslot du module.
 
-### 3. App.xaml.cs
+### 4. App.xaml.cs
 
 ```csharp
 using Wps.Module;
@@ -74,7 +105,7 @@ protected override void OnStartup(StartupEventArgs e)
 }
 ```
 
-### 4. MainWindow.xaml.cs — signaler READY au bon moment
+### 5. MainWindow.xaml.cs — signaler READY au bon moment
 
 Le READY indique au host **"je suis prêt à être affiché"** — c'est à ce moment que le host
 parke la fenêtre dans son slot. Le moment dépend de chaque module :
@@ -105,7 +136,7 @@ public MainWindow()
 ⚠️ Sans appel à `NotifyReadyAsync()`, le host timeoutera après 30s et killera le process.
 Un warning est loggé dans wipiLOG après 5s sans ready pour aider à diagnostiquer un oubli.
 
-### 5. (Optionnel) Hooks lifecycle via `IWpsModule`
+### 6. (Optionnel) Hooks lifecycle via `IWpsModule`
 
 Pour réagir aux événements du host (CLOSE demandé, RESIZE), implémente `IWpsModule` :
 

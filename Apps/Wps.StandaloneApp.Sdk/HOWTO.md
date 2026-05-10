@@ -34,14 +34,32 @@ au prochain démarrage et **refusera de lancer l'app** — alors que l'objectif 
 est précisément l'inverse : prévenir l'instabilité, pas en créer.
 
 **Avant d'intégrer le SDK à une app, vérifier que l'app ne crée AUCUN fichier dans
-son dossier d'installation au runtime.** Tout ce qui change à l'usage doit aller :
+son dossier d'installation au runtime.** Tout ce qui change à l'usage doit aller
+dans le **dossier de données canonique wipiSoft** :
+
+```
+<RépertoireWipiSoft>\Data\<AppName>\        (par défaut C:\_wipiSoft\Data\<AppName>\)
+```
+
+récupéré via le helper `WpsPaths.GetAppDataDir("<AppName>")` (cf. `_libs/WpsPaths.cs`).
 
 | Ressource | Bon emplacement |
 |---|---|
-| Cache, données utilisateur | `%LOCALAPPDATA%\<AppName>\` |
-| Préférences, settings utilisateur | `%LOCALAPPDATA%\<AppName>\` ou `HKCU\Software\wipiSoft\<AppName>\` |
-| Logs | `%LOCALAPPDATA%\<AppName>\logs\` (ou wipiLOG via `WpsDebugSender`) |
-| Cache WebView2 | **`CoreWebView2EnvironmentOptions.UserDataFolder`** redirigé vers `%LOCALAPPDATA%\<AppName>\WebView2\` |
+| Cache, données utilisateur, fichiers générés | `WpsPaths.GetAppDataDir("<AppName>")` |
+| Préférences, settings utilisateur | `HKCU\Software\wipiSoft\<AppName>\` (registre) ou un JSON dans `WpsPaths.GetAppDataDir(...)` |
+| Logs locaux | `WpsPaths.GetAppDataSubDir("<AppName>", "logs")` (ou wipiLOG via `WpsDebugSender`) |
+| Cache WebView2 | `CoreWebView2EnvironmentOptions.UserDataFolder` redirigé vers `WpsPaths.GetAppDataSubDir("<AppName>", "WebView2")` |
+
+> **Pourquoi pas `%LOCALAPPDATA%` ?** Par-utilisateur, invisible aux outils host
+> (wipiManager, wpsServices), impossible à inventorier/sauvegarder en bloc avec
+> le reste de l'installation. La convention wipiSoft regroupe tout sous une
+> seule racine machine (`C:\_wipiSoft\Data\`). Cf. en-tête de `_libs/WpsPaths.cs`.
+
+Source-link `WpsPaths.cs` dans le csproj de l'app :
+
+```xml
+<Compile Include="..\..\..\_libs\WpsPaths.cs" Link="Helpers\WpsPaths.cs" />
+```
 
 Pièges classiques à chasser **avant** la première intégration :
 
@@ -49,22 +67,19 @@ Pièges classiques à chasser **avant** la première intégration :
    l'exe (Crashpad, settings.dat, component_crx_cache, ~290 fichiers volatiles).
    Configurer explicitement `UserDataFolder` à la création de l'environnement :
    ```csharp
-   var userDataFolder = Path.Combine(
-       Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-       "<AppName>", "WebView2");
-   if (!Directory.Exists(userDataFolder)) Directory.CreateDirectory(userDataFolder);
+   var userDataFolder = wipisoft.WpsPaths.GetAppDataSubDir("<AppName>", "WebView2");
    var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
    await webView2.EnsureCoreWebView2Async(env);
    ```
    Mutualiser l'env via un `Lazy<Task<CoreWebView2Environment>>` static si plusieurs
    instances WebView2 coexistent (sinon WebView2 lance *"different environments"*).
 2. **PDF.js / autre archive zip extraite** : par défaut on extrait à côté de l'exe.
-   Rediriger vers `%LOCALAPPDATA%\<AppName>\` (l'archive `.zip` reste dans le
-   DeployDir, protégée — l'extraction live ailleurs).
+   Rediriger vers `WpsPaths.GetAppDataSubDir("<AppName>", "pdfjs")` (l'archive
+   `.zip` source reste dans le DeployDir, protégée — l'extraction live ailleurs).
 3. **WPF window state persisté en local** : du genre `<App>WindowStateSettings.json`
-   à côté de l'exe — déplacer vers `%LOCALAPPDATA%`.
+   à côté de l'exe — déplacer dans `WpsPaths.GetAppDataDir("<AppName>")`.
 4. **`File.WriteAllText` dans `AppDomain.CurrentDomain.BaseDirectory`** : détecter
-   les écritures relatives à l'exe (logs, dumps, temp files...).
+   les écritures relatives à l'exe (logs, dumps, temp files...) et les rediriger.
 
 ### Exclusions par défaut dans le PS1
 

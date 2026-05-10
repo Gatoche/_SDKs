@@ -48,7 +48,36 @@ Ajouter la référence SDK + l'import des targets unifiés :
 <Import Project="..\..\..\_SDKs\Modules\Wps.ModuleService.Sdk\Wps.ModuleService.Sdk.targets" />
 ```
 
-### 2. `Description.md` embarqué
+### 2. Stockage des données — convention wipiSoft
+
+Toute donnée hors-registre du service (cache, fichiers générés, settings JSON,
+extractions...) doit aller dans :
+
+```
+<RépertoireWipiSoft>\Data\<WipiModuleName>\        (par défaut C:\_wipiSoft\Data\<Name>\)
+```
+
+Source-link `WpsPaths.cs` dans le csproj :
+
+```xml
+<Compile Include="..\..\..\_libs\WpsPaths.cs" Link="Helpers\WpsPaths.cs" />
+```
+
+Et utilise-le partout où tu écris (le service tourne en background, donc même les
+petits fichiers de cache/état doivent passer par là, pas dans `BaseDirectory`) :
+
+```csharp
+var dataDir  = wipisoft.WpsPaths.GetAppDataDir("MonService");
+var stateDb  = Path.Combine(dataDir, "state.json");
+var cacheDir = wipisoft.WpsPaths.GetAppDataSubDir("MonService", "cache");
+```
+
+> **Pourquoi pas `%LOCALAPPDATA%` ?** Par-utilisateur, invisible aux outils host.
+> La convention wipiSoft regroupe tout sous une seule racine machine. Cf.
+> en-tête de `_libs/WpsPaths.cs`. Pour les vrais secrets utilisateur, continuer
+> à utiliser HKCU (`WpsHKCU`).
+
+### 3. `Description.md` embarqué
 
 Crée un `Description.md` à la racine du projet (titre, méthodes exposées avec signatures,
 persistance HKCU). Puis :
@@ -59,7 +88,7 @@ persistance HKCU). Puis :
 </ItemGroup>
 ```
 
-### 3. App.xaml.cs — pattern dual-mode (embedded vs standalone)
+### 4. App.xaml.cs — pattern dual-mode (embedded vs standalone)
 
 Le service doit fonctionner **dans les deux modes** : sans `--wps-session` (mode debug
 direct) et avec (mode pilotée par le host). Pattern de référence (extrait de TracePML) :
@@ -160,7 +189,7 @@ public sealed class EmptyParams { }
 public sealed class MyStatusResult { /* ... */ }
 ```
 
-### 4. Méthodes Invoke à exposer
+### 5. Méthodes Invoke à exposer
 
 Dans `ConfigureEmbeddedAsync`, déclare les méthodes que ton service expose :
 
@@ -180,7 +209,7 @@ WpsModuleService.RegisterInvokeHandler<TParams, TResult>(
 - Le SDK exécute le handler depuis le ReadLoop IPC (ThreadPool) — si tu accèdes à des
   contrôles WPF, marshall via `Application.Current.Dispatcher`.
 
-### 5. Mode Daemon (HKCU)
+### 6. Mode Daemon (HKCU)
 
 Pas de code à ajouter côté service : le host gère le flag Daemon via
 `WpsServiceDaemonConfig` (clé `HKCU\Software\wipiSoft\<HostName>\Services\<Name>\Daemon`).
