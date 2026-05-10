@@ -70,7 +70,7 @@ public partial class ServiceControlPage : UserControl
         RefreshStatus();
     }
 
-    private void OnIsVisibleChangedHandler(object? sender, DependencyPropertyChangedEventArgs e)
+    private async void OnIsVisibleChangedHandler(object? sender, DependencyPropertyChangedEventArgs e)
     {
         if (_service is null) return;
         bool visible = (bool)e.NewValue;
@@ -86,17 +86,26 @@ public partial class ServiceControlPage : UserControl
         {
             _statusTimer.Stop();
 
-            // OnDemand actif (l'user avait cliqué Redémarrer pendant la visibilité) : on tue
-            // à la sortie. Sauf si le user a basculé Daemon=true pendant la visite, auquel cas
-            // le client a été promu au host (_ownsClient=false).
+            // OnDemand actif (l'user avait cliqué Redémarrer pendant la visibilité) : on ferme
+            // gracieusement à la sortie pour que le service ait le temps de cleanup
+            // (Window_Closing → AppBar Unregister, etc.). Sauf si le user a basculé Daemon=true
+            // pendant la visite, auquel cas le client a été promu au host (_ownsClient=false).
             if (_ownsClient && _client is not null)
             {
-                WpsDebugSender.Log($"ServiceControlPage [{_service.Name}]: page hidden → kill (OnDemand)",
+                WpsDebugSender.Log($"ServiceControlPage [{_service.Name}]: page hidden → graceful shutdown (OnDemand)",
                     LogLevel.Info, LogTag);
-                _client.KillImmediate();
-                _client.Dispose();
+                var c = _client;
                 _client = null;
                 _ownsClient = false;
+                try { await c.ShutdownAsync().ConfigureAwait(true); }
+                catch (Exception ex)
+                {
+                    WpsDebugSender.Log($"ServiceControlPage [{_service?.Name}]: ShutdownAsync threw {ex.GetType().Name}: {ex.Message}",
+                        LogLevel.Warning, LogTag);
+                }
+                // Pas de c.Dispose() ici : ShutdownAsync libère déjà connexion + process
+                // (cf. WpsModuleServiceClient.DisposeUnmanaged appelé en fin de Shutdown).
+                // Le double dispose serait idempotent grâce à _disposed mais reste du bruit.
             }
         }
     }
@@ -237,9 +246,15 @@ public partial class ServiceControlPage : UserControl
         WpsDebugSender.Log($"ServiceControlPage [{_service.Name}]: Restart requested", LogLevel.Info, LogTag);
         if (_client is not null)
         {
-            _client.KillImmediate();
-            _client.Dispose();
+            var c = _client;
             _client = null;
+            try { await c.ShutdownAsync().ConfigureAwait(true); }
+            catch (Exception ex)
+            {
+                WpsDebugSender.Log($"ServiceControlPage [{_service.Name}]: ShutdownAsync threw {ex.GetType().Name}: {ex.Message}",
+                    LogLevel.Warning, LogTag);
+            }
+            // Pas de c.Dispose() ici : ShutdownAsync libère déjà connexion + process.
         }
         // Relance via le même chemin que OnDemand (et notifie le host si Daemon)
         DaemonToggleChanged?.Invoke(_service, WpsServiceDaemonConfig.IsDaemonEnabled(_hostName, _service.Name));
@@ -248,14 +263,20 @@ public partial class ServiceControlPage : UserControl
         RefreshStatus();
     }
 
-    private void OnStopClick(object sender, RoutedEventArgs e)
+    private async void OnStopClick(object sender, RoutedEventArgs e)
     {
         if (_service is null || _client is null) return;
-        WpsDebugSender.Log($"ServiceControlPage [{_service.Name}]: Stop requested", LogLevel.Info, LogTag);
-        _client.KillImmediate();
-        _client.Dispose();
+        WpsDebugSender.Log($"ServiceControlPage [{_service.Name}]: Stop requested → graceful shutdown", LogLevel.Info, LogTag);
+        var c = _client;
         _client = null;
         _ownsClient = false;
+        try { await c.ShutdownAsync().ConfigureAwait(true); }
+        catch (Exception ex)
+        {
+            WpsDebugSender.Log($"ServiceControlPage [{_service?.Name}]: ShutdownAsync threw {ex.GetType().Name}: {ex.Message}",
+                LogLevel.Warning, LogTag);
+        }
+        // Pas de c.Dispose() ici : ShutdownAsync libère déjà connexion + process.
         RefreshStatus();
     }
 }
