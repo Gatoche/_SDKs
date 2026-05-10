@@ -19,7 +19,7 @@ namespace Wps.Module.Hosting;
 /// await client.LaunchAsync(@"C:\_wipiSoft\Apps\Modules\Demo5.Echo\Demo5.Echo.exe");
 /// var result = await client.InvokeAsync&lt;EchoParams, EchoResult&gt;("Echo", new EchoParams { Name = "Gatoche" });
 /// // ... plus tard ...
-/// client.KillImmediate();
+/// await client.ShutdownAsync();   // ou client.Dispose() en contexte sync
 /// </code>
 /// </summary>
 public sealed class WpsModuleServiceClient : IDisposable
@@ -28,6 +28,9 @@ public sealed class WpsModuleServiceClient : IDisposable
     private Process? _process;
     private string _sessionId = "";
     private bool _ready;
+    /// <summary>Idempotence du <see cref="ShutdownAsync"/> : true après le 1er appel,
+    /// les suivants sont no-op. Symétrique à <c>WpsModuleSlot._disposed</c>.</summary>
+    private bool _disposed;
 
     // Map requestId → TCS pour corréler INVOKE_RESULT à l'appel InvokeAsync.
     // ConcurrentDictionary car InvokeResultReceived peut fire depuis le ReadLoop pendant
@@ -244,26 +247,117 @@ public sealed class WpsModuleServiceClient : IDisposable
     /// <summary>Demande la fermeture propre via CLOSE.</summary>
     public Task RequestCloseAsync() => _connection?.SendCloseAsync() ?? Task.CompletedTask;
 
-    /// <summary>Tue le process immédiatement.</summary>
-    public void KillImmediate()
+    /// <summary>
+    /// Terminaison canonique du client : envoie CLOSE via IPC, attend l'exit du process
+    /// pendant <paramref name="gracePeriodMs"/> puis Kill(true) si grâce dépassée, et libère
+    /// toutes les ressources (connexion + process). Idempotent — appelable plusieurs fois
+    /// sans risque, devient no-op après le premier appel.
+    /// <para>Default grace = <b>7000ms</b> : couvre les cleanups réalistes en production
+    /// (flush SMB, ABM_REMOVE d'AppBar, commit MariaDB) avec marge pour les configs un peu
+    /// justes en mémoire qui peuvent swapper. L'ancien default de 1500ms shootait MiniBoard
+    /// pendant son désenregistrement AppBar — d'où ce bump.</para>
+    /// <para>Utiliser <c>gracePeriodMs=0</c> pour "kill immédiat propre" (envoie CLOSE puis
+    /// Kill sans attendre — le service essaie son cleanup en best-effort dans la fenêtre du
+    /// pipe duplex avant disposition). Réservé aux cas où l'on sait qu'aucun cleanup n'est
+    /// attendu.</para>
+    /// <para>C'est le SEUL chemin de fermeture exposé : <see cref="Dispose"/> route ici en
+    /// version sync avec grace=2000 (compromis cleanup minimal vs blocage thread sync).
+    /// Les consumers ne peuvent pas contourner le cleanup gracieux par accident.</para>
+    /// </summary>
+    public async Task ShutdownAsync(int gracePeriodMs = 7000)
     {
+        if (_disposed) return;
+        _disposed = true;
+
         var sidShort = string.IsNullOrEmpty(_sessionId) ? "?" : _sessionId[..Math.Min(8, _sessionId.Length)];
-        WpsDebugSender.Log($"KillImmediate [{sidShort}]: pid={_process?.Id ?? -1} hasExited={_process?.HasExited}", LogLevel.Info, LogTag);
-        try { if (_process is { HasExited: false }) _process.Kill(true); }
+
+        if (_process is null || _process.HasExited)
+        {
+            WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: process already exited", LogLevel.Info, LogTag);
+            FailAllPendingInvokes("service already exited");
+            DisposeUnmanaged();
+            return;
+        }
+
+        // 1) Demande gracieuse via CLOSE IPC (même si grace=0, on tente — le service peut
+        //    faire son cleanup dans la fenêtre où le pipe est encore ouvert).
+        try
+        {
+            WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: sending CLOSE (grace={gracePeriodMs}ms)", LogLevel.Info, LogTag);
+            await RequestCloseAsync().ConfigureAwait(false);
+        }
         catch (Exception ex)
         {
-            WpsDebugSender.Log($"KillImmediate [{sidShort}]: Kill threw {ex.GetType().Name}: {ex.Message}", LogLevel.Trace, LogTag);
+            WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: SendCloseAsync threw {ex.GetType().Name}: {ex.Message} — falling back to Kill", LogLevel.Warning, LogTag);
         }
-        FailAllPendingInvokes("service killed");
-        _connection?.Dispose();
-        _connection = null;
+
+        // 2) Attendre exit gracieux (sauté si grace=0)
+        if (gracePeriodMs > 0)
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(gracePeriodMs);
+                await _process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+                WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: process exited gracefully", LogLevel.Success, LogTag);
+            }
+            catch (OperationCanceledException)
+            {
+                WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: grace period expired → Kill(true)", LogLevel.Warning, LogTag);
+            }
+            catch (Exception ex)
+            {
+                WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: WaitForExitAsync threw {ex.GetType().Name}: {ex.Message}", LogLevel.Warning, LogTag);
+            }
+        }
+
+        // 3) Fallback Kill si encore vivant
+        if (_process is { HasExited: false })
+        {
+            try { _process.Kill(true); }
+            catch (Exception ex)
+            {
+                WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: Kill threw {ex.GetType().Name}: {ex.Message}", LogLevel.Trace, LogTag);
+            }
+        }
+
+        FailAllPendingInvokes("service shut down");
+        DisposeUnmanaged();
     }
 
+    /// <summary>
+    /// Version synchrone de <see cref="ShutdownAsync"/> avec grace=2000ms (envoie CLOSE,
+    /// laisse 2s au service pour son cleanup, puis Kill si nécessaire). À utiliser
+    /// uniquement quand on ne peut pas await (ex : <c>using</c> statement, finalizer-like
+    /// context). Préférer <c>await ShutdownAsync()</c> partout où possible — le default
+    /// 7000ms donne plus d'air pour un cleanup propre.
+    /// <para>Pourquoi 2000 et pas 0 : <c>Dispose</c> est souvent appelé depuis un contexte
+    /// sync où bloquer 2s n'est pas dramatique, mais où shooter le cleanup applicatif l'est.
+    /// 2s couvre les cleanups courts (close handles, flush log) sans bloquer trop longtemps
+    /// le thread appelant. Pour des cleanups longs : <c>await ShutdownAsync()</c> avec
+    /// default 7000.</para>
+    /// <para>NB : malgré le nom <see cref="IDisposable.Dispose"/>, ce chemin envoie CLOSE
+    /// via IPC en premier — le service a sa fenêtre de cleanup avant Kill éventuel. Le SDK
+    /// ne dispose JAMAIS d'un process sans avoir au moins notifié le service.</para>
+    /// </summary>
     public void Dispose()
     {
-        FailAllPendingInvokes("client disposed");
-        _connection?.Dispose();
-        _process?.Dispose();
+        if (_disposed) return;
+        // Routage vers ShutdownAsync(2000) en sync. .GetAwaiter().GetResult() est OK ici car
+        // 2s reste un délai borné, raisonnable pour un Dispose synchrone.
+        try { ShutdownAsync(2000).GetAwaiter().GetResult(); }
+        catch (Exception ex)
+        {
+            WpsDebugSender.Log($"Dispose: ShutdownAsync(2000) threw {ex.GetType().Name}: {ex.Message}", LogLevel.Warning, LogTag);
+            // Filet ultime : si ShutdownAsync a planté avant le DisposeUnmanaged, on libère ici.
+            DisposeUnmanaged();
+        }
+    }
+
+    private void DisposeUnmanaged()
+    {
+        try { _connection?.Dispose(); } catch { }
+        _connection = null;
+        try { _process?.Dispose(); } catch { }
     }
 }
 

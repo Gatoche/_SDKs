@@ -20,7 +20,7 @@ namespace Wps.Module.Hosting;
 /// slot.Ready += () => /* embed slot.ModuleHwnd ici */;
 /// await slot.LaunchAsync(@"C:\path\to\module.exe");
 /// // ... plus tard ...
-/// slot.KillImmediate();
+/// await slot.ShutdownAsync();   // ou slot.Dispose() en contexte sync
 /// </code>
 /// </summary>
 public sealed class WpsModuleSlot : IDisposable
@@ -28,6 +28,7 @@ public sealed class WpsModuleSlot : IDisposable
     private WpsHostConnection? _connection;
     private Process? _process;
     private string _sessionId = "";
+    private bool _disposed;
 
     /// <summary>Path de l'exécutable du module (set au moment du Launch).</summary>
     public string? ModulePath { get; private set; }
@@ -160,24 +161,105 @@ public sealed class WpsModuleSlot : IDisposable
     public Task SendResizeAsync(double dipW, double dipH, double dpi) =>
         _connection?.SendResizeAsync(dipW, dipH, dpi) ?? Task.CompletedTask;
 
-    /// <summary>Tue le process immédiatement (sans grâce). À utiliser si CLOSE ne répond pas
-    /// ou pour fermeture forcée à la sortie du host.</summary>
-    public void KillImmediate()
+    /// <summary>
+    /// Terminaison canonique du slot : envoie CLOSE via IPC, attend l'exit du process
+    /// pendant <paramref name="gracePeriodMs"/> puis Kill(true) si grâce dépassée, et libère
+    /// toutes les ressources (connexion + process). Idempotent.
+    /// <para>Default grace = <b>7000ms</b> : couvre les cleanups réalistes en production
+    /// (flush SMB, ABM_REMOVE d'AppBar, commit MariaDB) avec marge pour les configs un peu
+    /// justes en mémoire qui peuvent swapper. L'ancien default de 1500ms shootait MiniBoard
+    /// pendant son désenregistrement AppBar — d'où ce bump.</para>
+    /// <para>Utiliser <c>gracePeriodMs=0</c> pour "kill immédiat propre" (envoie CLOSE puis
+    /// Kill sans attendre — le module essaie son cleanup en best-effort dans la fenêtre du
+    /// pipe avant disposition). Réservé aux cas où l'on sait qu'aucun cleanup n'est attendu.</para>
+    /// <para>C'est le SEUL chemin de fermeture exposé : <see cref="Dispose"/> route ici en
+    /// version sync avec grace=2000 (compromis cleanup minimal vs blocage UI thread sync).
+    /// Les consumers ne peuvent pas contourner le cleanup gracieux par accident.</para>
+    /// </summary>
+    public async Task ShutdownAsync(int gracePeriodMs = 7000)
     {
+        if (_disposed) return;
+        _disposed = true;
+
         var sidShort = string.IsNullOrEmpty(_sessionId) ? "?" : _sessionId[..Math.Min(8, _sessionId.Length)];
-        WpsDebugSender.Log($"KillImmediate [{sidShort}]: pid={_process?.Id ?? -1} hasExited={_process?.HasExited}", LogLevel.Info, LogTag);
-        try { if (_process is { HasExited: false }) _process.Kill(true); }
+
+        if (_process is null || _process.HasExited)
+        {
+            WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: process already exited", LogLevel.Info, LogTag);
+            DisposeUnmanaged();
+            return;
+        }
+
+        // 1) Demande gracieuse via CLOSE IPC (même si grace=0, on tente — le module peut
+        //    faire son cleanup dans la fenêtre où le pipe est encore ouvert).
+        try
+        {
+            WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: sending CLOSE (grace={gracePeriodMs}ms)", LogLevel.Info, LogTag);
+            await RequestCloseAsync().ConfigureAwait(false);
+        }
         catch (Exception ex)
         {
-            WpsDebugSender.Log($"KillImmediate [{sidShort}]: Kill threw {ex.GetType().Name}: {ex.Message}", LogLevel.Trace, LogTag);
+            WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: SendCloseAsync threw {ex.GetType().Name}: {ex.Message} — falling back to Kill", LogLevel.Warning, LogTag);
         }
-        _connection?.Dispose();
-        _connection = null;
+
+        // 2) Attendre exit gracieux (sauté si grace=0)
+        if (gracePeriodMs > 0)
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(gracePeriodMs);
+                await _process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+                WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: process exited gracefully", LogLevel.Success, LogTag);
+            }
+            catch (OperationCanceledException)
+            {
+                WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: grace period expired → Kill(true)", LogLevel.Warning, LogTag);
+            }
+            catch (Exception ex)
+            {
+                WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: WaitForExitAsync threw {ex.GetType().Name}: {ex.Message}", LogLevel.Warning, LogTag);
+            }
+        }
+
+        // 3) Fallback Kill si encore vivant
+        if (_process is { HasExited: false })
+        {
+            try { _process.Kill(true); }
+            catch (Exception ex)
+            {
+                WpsDebugSender.Log($"ShutdownAsync [{sidShort}]: Kill threw {ex.GetType().Name}: {ex.Message}", LogLevel.Trace, LogTag);
+            }
+        }
+
+        DisposeUnmanaged();
     }
 
+    /// <summary>
+    /// Version synchrone de <see cref="ShutdownAsync"/> avec grace=2000ms (envoie CLOSE,
+    /// laisse 2s au module pour son cleanup, puis Kill si nécessaire). À utiliser
+    /// uniquement quand on ne peut pas await. Préférer <c>await ShutdownAsync()</c> partout
+    /// où possible — le default 7000ms donne plus d'air pour un cleanup propre.
+    /// <para>Pourquoi 2000 et pas 0 : <c>Dispose</c> est souvent appelé depuis un contexte
+    /// sync (using, finalizer-like) où bloquer 2s n'est pas dramatique, mais où shooter le
+    /// cleanup applicatif l'est. 2s couvre les cleanups courts (fermeture handles, log
+    /// flush) sans bloquer trop longtemps un thread appelant. Pour les cleanups longs il
+    /// faut passer par <c>await ShutdownAsync()</c> avec le default 7000.</para>
+    /// </summary>
     public void Dispose()
     {
-        _connection?.Dispose();
-        _process?.Dispose();
+        if (_disposed) return;
+        try { ShutdownAsync(2000).GetAwaiter().GetResult(); }
+        catch (Exception ex)
+        {
+            WpsDebugSender.Log($"Dispose: ShutdownAsync(2000) threw {ex.GetType().Name}: {ex.Message}", LogLevel.Warning, LogTag);
+            DisposeUnmanaged();
+        }
+    }
+
+    private void DisposeUnmanaged()
+    {
+        try { _connection?.Dispose(); } catch { }
+        _connection = null;
+        try { _process?.Dispose(); } catch { }
     }
 }
