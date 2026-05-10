@@ -134,10 +134,19 @@ public static class WpsModuleService
 
     /// <summary>(v1.3) Optionnel : enregistre un implémenteur de <see cref="IWpsModule"/> pour
     /// recevoir les hooks lifecycle (<c>OnCanCloseRequestedAsync</c>, <c>OnCanCloseAborted</c>,
-    /// <c>OnShutdownRequested</c>, <c>OnHostDisconnected</c>). À appeler AVANT
-    /// <see cref="BootstrapAsync"/> ou très tôt — sinon le négociateur n'aura pas la référence
-    /// et le SDK utilisera le comportement par défaut (Ok à tous les CAN_CLOSE).</summary>
-    public static void Register(IWpsModule module) => _module = module;
+    /// <c>OnShutdownRequested</c>, <c>OnHostDisconnected</c>).
+    /// <para>L'ordre Register/Bootstrap est indifférent : si Register est appelé après
+    /// <see cref="BootstrapAsync"/>, on propage la référence au négociateur déjà créé. Sans
+    /// cette propagation, le négociateur capturait null à sa construction et retournait Ok
+    /// par défaut à tous les CAN_CLOSE — le host fermait alors le service instantanément
+    /// sans laisser à l'app la possibilité de répondre Busy/NeedUser/Rejected.</para></summary>
+    public static void Register(IWpsModule module)
+    {
+        _module = module;
+        // Si Bootstrap a déjà couru, le négociateur existe déjà avec _module=null capturé.
+        // On lui pousse la nouvelle référence pour que les prochains CAN_CLOSE l'invoquent.
+        if (_negotiator is not null) _negotiator.Module = module;
+    }
 
     /// <summary>
     /// Enregistre un handler typé pour une méthode invocable. Le SDK gère sérialisation /

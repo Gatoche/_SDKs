@@ -50,7 +50,15 @@ internal sealed class WpsModuleShutdownNegotiator
     }
 
     private readonly Dispatcher _uiDispatcher;
-    private readonly IWpsModule? _module;
+
+    /// <summary>Implémenteur du hook applicatif. Mutable et propagé par
+    /// <see cref="WpsModule.Register"/> — sans ça l'app DOIT appeler Register AVANT
+    /// <see cref="WpsModule.Bootstrap"/>, sinon le négociateur capturait null à sa construction
+    /// et retournait Ok par défaut à tous les CAN_CLOSE (le host fermait tout instantanément
+    /// sans laisser l'app répondre Busy/NeedUser/Rejected). Le setter rend l'ordre
+    /// Register/Bootstrap indifférent côté app.</summary>
+    internal IWpsModule? Module { get; set; }
+
     private readonly WpsModuleConnection _connection;
 
     private readonly object _lock = new();
@@ -69,7 +77,7 @@ internal sealed class WpsModuleShutdownNegotiator
     public WpsModuleShutdownNegotiator(Dispatcher uiDispatcher, IWpsModule? module, WpsModuleConnection connection)
     {
         _uiDispatcher = uiDispatcher;
-        _module = module;
+        Module = module;
         _connection = connection;
     }
 
@@ -104,13 +112,17 @@ internal sealed class WpsModuleShutdownNegotiator
         // faire transiter une ValueTask<CanCloseDecision> à travers le Dispatcher.
         // (`_ =` : on ignore explicitement le DispatcherOperation retourné — la synchronisation
         // se fait via le TCS, pas via le résultat de BeginInvoke.)
+        // Lecture locale stable du provider mutable (cf. champ Module). Si l'app a fait
+        // Register après Bootstrap, la valeur est désormais celle qu'elle a passée ; sinon
+        // c'est null et on retourne Ok par défaut (comportement documenté).
+        var module = Module;
         var tcs = new TaskCompletionSource<CanCloseDecision>(TaskCreationOptions.RunContinuationsAsynchronously);
         _ = _uiDispatcher.BeginInvoke(new Action(async () =>
         {
             try
             {
-                var decision = _module is not null
-                    ? await _module.OnCanCloseRequestedAsync(ctx).ConfigureAwait(false)
+                var decision = module is not null
+                    ? await module.OnCanCloseRequestedAsync(ctx).ConfigureAwait(false)
                     : CanCloseDecision.Ok;
                 tcs.TrySetResult(decision);
             }
@@ -198,7 +210,7 @@ internal sealed class WpsModuleShutdownNegotiator
         }
         _uiDispatcher.BeginInvoke(new Action(() =>
         {
-            try { _module?.OnCanCloseAborted(); }
+            try { Module?.OnCanCloseAborted(); }
             catch (Exception ex)
             {
                 WpsDebugSender.Log(
@@ -237,7 +249,8 @@ internal sealed class WpsModuleShutdownNegotiator
         {
             try
             {
-                if (_module is not null) _module.OnShutdownRequested();
+                var module = Module;
+                if (module is not null) module.OnShutdownRequested();
                 else System.Windows.Application.Current?.Shutdown();
                 tcs.TrySetResult(true);
             }

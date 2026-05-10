@@ -23,7 +23,14 @@ internal sealed class WpsModuleServiceShutdownNegotiator
     /// <summary>États du cycle de fermeture côté ModuleService. Identique au Module classique.</summary>
     internal enum State { Idle, Checking, Busy, NeedUser, Locked, Closing }
 
-    private readonly IWpsModule? _module;
+    /// <summary>Implémenteur du hook applicatif. Mutable et propagé par
+    /// <see cref="WpsModuleService.Register"/> — sans ça l'app DOIT appeler Register AVANT
+    /// BootstrapAsync, sinon le négociateur capturait null à sa construction et retournait
+    /// Ok par défaut à tous les CAN_CLOSE (le host fermait tout instantanément, sans laisser
+    /// l'app répondre Busy/NeedUser/Rejected). Le setter rend l'ordre Register/Bootstrap
+    /// indifférent côté app.</summary>
+    internal IWpsModule? Module { get; set; }
+
     private readonly WpsModuleServiceConnection _connection;
 
     private readonly object _lock = new();
@@ -39,7 +46,7 @@ internal sealed class WpsModuleServiceShutdownNegotiator
 
     public WpsModuleServiceShutdownNegotiator(IWpsModule? module, WpsModuleServiceConnection connection)
     {
-        _module = module;
+        Module = module;
         _connection = connection;
     }
 
@@ -130,7 +137,7 @@ internal sealed class WpsModuleServiceShutdownNegotiator
         var dispatcher = Application.Current?.Dispatcher;
         Action invoke = () =>
         {
-            try { _module?.OnCanCloseAborted(); }
+            try { Module?.OnCanCloseAborted(); }
             catch (Exception ex)
             {
                 WpsDebugSender.Log(
@@ -160,7 +167,7 @@ internal sealed class WpsModuleServiceShutdownNegotiator
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             _ = dispatcher.BeginInvoke(new Action(() =>
             {
-                try { _module?.OnShutdownRequested(); }
+                try { Module?.OnShutdownRequested(); }
                 catch (Exception ex)
                 {
                     WpsDebugSender.Log(
@@ -173,7 +180,7 @@ internal sealed class WpsModuleServiceShutdownNegotiator
         }
         else
         {
-            try { _module?.OnShutdownRequested(); }
+            try { Module?.OnShutdownRequested(); }
             catch (Exception ex)
             {
                 WpsDebugSender.Log(
@@ -198,13 +205,17 @@ internal sealed class WpsModuleServiceShutdownNegotiator
 
     private async Task<CanCloseDecision> CallHookOnAppropriateContextAsync(CanCloseContext ctx)
     {
-        if (_module is null) return CanCloseDecision.Ok;
+        // Lecture locale stable du provider mutable (cf. champ Module). Si l'app a fait
+        // Register après Bootstrap, la valeur est désormais celle qu'elle a passée ; sinon
+        // c'est null et on retourne Ok par défaut (comportement documenté).
+        var module = Module;
+        if (module is null) return CanCloseDecision.Ok;
 
         var dispatcher = Application.Current?.Dispatcher;
         if (dispatcher is null || dispatcher.CheckAccess())
         {
             // Pas d'UI thread WPF (console pure) ou déjà sur le bon thread : appel direct
-            return await _module.OnCanCloseRequestedAsync(ctx).ConfigureAwait(false);
+            return await module.OnCanCloseRequestedAsync(ctx).ConfigureAwait(false);
         }
 
         // Marshalling sur UI thread WPF via TCS (cohérent avec le ModuleSDK classique)
@@ -213,7 +224,7 @@ internal sealed class WpsModuleServiceShutdownNegotiator
         {
             try
             {
-                var d = await _module.OnCanCloseRequestedAsync(ctx).ConfigureAwait(false);
+                var d = await module.OnCanCloseRequestedAsync(ctx).ConfigureAwait(false);
                 tcs.TrySetResult(d);
             }
             catch (Exception ex)
