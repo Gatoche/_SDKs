@@ -291,6 +291,53 @@ APIs publiques v1.3 supplémentaires :
   (bouton Quitter dans la settings window, etc.) — permet au host de griser proprement
 - `WpsModuleService.ResolveCanClose(decision)` pour résoudre un Busy/NeedUser asynchrone
 
+#### `NeedUser` : la modale est affichée par le HOST
+
+Depuis v1.3 final, la modale de confirmation NeedUser est affichée **côté host** (pas
+côté service). Le service ne fait que **déclarer** la question et les boutons :
+
+```csharp
+return new ValueTask<CanCloseDecision>(
+    CanCloseDecision.NeedUser(
+        reason: "Document non sauvegardé",
+        question: "Voulez-vous fermer sans sauvegarder ?",
+        buttons: WpsDialogButtons.YesNoCancel));
+```
+
+Le host reçoit `CAN_CLOSE_NEED_USER|reason|question|buttons` via le wire-protocol,
+appelle son propre `MessageBox.Show` (titre = nom du service + reason, owner = host),
+et renvoie au service le résultat via `USER_RESPONSE|result`. Le SDK ModuleService
+mappe automatiquement :
+
+- `Yes` ou `Ok` → `CAN_CLOSE_OK` (équivalent à un retour `CanCloseDecision.Ok`)
+- `No` ou `Cancel` → `CAN_CLOSE_REJECTED` (équivalent à un `CanCloseDecision.Rejected`)
+
+**Avantages de cette architecture** :
+
+- **Services console pures compatibles nativement** : pas besoin d'`Application.Current`
+  WPF, pas de thread STA dédié, pas de message pump. La déclaration `NeedUser(...)` est
+  juste une string-tuple envoyée sur le pipe. Si ton service est une vraie console
+  (`OutputType=Exe`, pas `WinExe`), ça fonctionne sans rien ajouter.
+- **Pas de focus war cross-process** : la modale est top-level dans le process host,
+  owned par sa MainWindow → focus management trivial, pas de `SetForegroundWindow`
+  cross-process restreint, pas de hover-forward à neutraliser.
+- **Style cohérent host** : icône, fonte, couleur, position — l'utilisateur voit la
+  même apparence quelle que soit la provenance de la question.
+- **Sérialisation auto** : si N services répondent NeedUser dans la même séquence de
+  shutdown, le host les enchaîne séquentiellement (une modale à la fois).
+
+**Le service n'a donc PAS besoin** :
+
+- ~~D'ouvrir manuellement sa SettingsWindow comme owner~~
+- ~~De gérer un thread STA WPF pour console pure~~
+- ~~D'appeler `MessageBox.Show` lui-même~~
+
+Si l'app veut un mapping custom des résultats (rare — ex: traiter `Cancel` comme un
+Busy "sauvegarde en cours" plutôt qu'un refus net), elle peut court-circuiter en
+appelant elle-même `WpsModuleService.ResolveCanClose(...)` avant que le host ne
+réponde — la state machine accepte n'importe quelle décision tant qu'on est en
+NeedUser, et la résolution applicative gagne sur le mapping standard.
+
 ## Test
 
 ### Standalone
@@ -337,5 +384,7 @@ pageslot → tu vois le statut (Running/Stopped), boutons Paramètres/Redémarre
 - **(v1.3) Retour `Busy(estimatedMs)` sans envoyer de `BUSY_PROGRESS`** → le host considère
   le service figé après ~8s de silence et passe au Kill. Toujours envoyer
   `WpsModuleService.ReportBusyProgress(...)` toutes les ~3s pendant un Busy.
-- **(v1.3) Oubli de `WpsModuleService.ResolveCanClose(...)` après un Busy/NeedUser** → host
+- **(v1.3) Oubli de `WpsModuleService.ResolveCanClose(...)` après un Busy** → host
   reste en attente jusqu'au timeout, puis Kill. Toujours résoudre par Ok ou Rejected.
+  Note : pour NeedUser, la résolution est automatique via le mapping host-side
+  USER_RESPONSE (pas besoin d'appeler `ResolveCanClose` manuellement).

@@ -167,7 +167,7 @@ final. Le module peut **négocier** sa fermeture en répondant :
 |---|---|
 | `CanCloseDecision.Ok` | Libre, je m'engage à fermer (default DIM = Ok = comportement v1.2) |
 | `CanCloseDecision.Busy(reason, estimatedMs)` | Occupé, ~Xms restant (le host attend des `BUSY_PROGRESS`) |
-| `CanCloseDecision.NeedUser(reason)` | Besoin d'un dialog utilisateur (host bascule l'onglet + focus) |
+| `CanCloseDecision.NeedUser(reason, question, buttons)` | Besoin d'une confirmation utilisateur — le HOST affiche la modale (pas le module) |
 | `CanCloseDecision.Rejected(reason)` | L'utilisateur a refusé — le host annule sa fermeture |
 
 **Cas le plus simple** : cleanup synchrone rapide avant de répondre Ok.
@@ -202,31 +202,37 @@ private async Task SaveAndResolveAsync()
 }
 ```
 
-**Cas dialog utilisateur** (genre "Voulez-vous sauvegarder ?") :
+**Cas confirmation utilisateur** (genre "Voulez-vous sauvegarder ?") — depuis v1.3 final,
+**la modale est affichée par le HOST**, pas par le module. Le module ne fait que déclarer
+la question + les boutons, le SDK reçoit `USER_RESPONSE` du host et résout
+automatiquement (Yes/Ok → Ok, No/Cancel → Rejected) :
 
 ```csharp
 public ValueTask<CanCloseDecision> OnCanCloseRequestedAsync(CanCloseContext ctx)
 {
     if (HasUnsavedChanges)
     {
-        _ = ShowSaveDialogAsync();
-        return new ValueTask<CanCloseDecision>(CanCloseDecision.NeedUser("Document non sauvegardé"));
+        return new ValueTask<CanCloseDecision>(
+            CanCloseDecision.NeedUser(
+                reason: "Document non sauvegardé",
+                question: "Voulez-vous fermer sans sauvegarder ?",
+                buttons: WpsDialogButtons.YesNoCancel));
     }
     return new ValueTask<CanCloseDecision>(CanCloseDecision.Ok);
 }
-private async Task ShowSaveDialogAsync()
-{
-    var result = MessageBox.Show("Sauvegarder avant de fermer ?", ..., MessageBoxButton.YesNoCancel);
-    var decision = result switch
-    {
-        MessageBoxResult.Yes    => /* save then */ CanCloseDecision.Ok,
-        MessageBoxResult.No     => CanCloseDecision.Ok,
-        MessageBoxResult.Cancel => CanCloseDecision.Rejected("L'utilisateur a annulé"),
-        _ => CanCloseDecision.Ok,
-    };
-    await WpsModule.ResolveCanClose(decision);
-}
 ```
+
+C'est tout. **Pas besoin** d'appeler `MessageBox.Show` ni `ResolveCanClose` côté module —
+le host gère l'affichage et le SDK fait le mapping résultat → décision automatiquement.
+
+**Avantages** : style cohérent host (icône, fonte, position), pas de focus war
+cross-process, sérialisation auto si N modules répondent NeedUser dans la même séquence.
+
+**Mapping custom** (rare) : si tu veux traiter un bouton spécifique différemment du
+mapping standard (ex: `Cancel` → `Busy("sauvegarde en cours")` au lieu de `Rejected`),
+tu peux court-circuiter en appelant toi-même `WpsModule.ResolveCanClose(...)` avant que
+le host ne réponde — la state machine accepte n'importe quelle décision tant qu'on est
+en NeedUser, et la résolution applicative gagne sur le mapping standard.
 
 **Mode urgent (shutdown OS)** : si `ctx.IsUrgent = true`, le SDK clamp automatiquement
 `NeedUser` et `Rejected` en `Busy(2000ms)` — pas de dialog ni de veto pendant un shutdown
@@ -286,6 +292,8 @@ Cliquer dessus → le host launch ton .exe avec `--wps-session XXX` → handshak
   le module figé après ~8s de silence et passe au Kill. Si tu retournes Busy, envoie un
   `WpsModule.ReportBusyProgress(...)` toutes les ~3s pour rester dans la fenêtre du
   watchdog (= 2× la période recommandée 3s + 2s de marge swap = 8s).
-- **(v1.3) Oubli de `WpsModule.ResolveCanClose(...)` après un Busy/NeedUser** → le host
-  reste en attente jusqu'au timeout, puis Kill. Toujours appeler `ResolveCanClose(Ok)` ou
-  `ResolveCanClose(Rejected(...))` quand le travail Busy est fini ou le dialog tranché.
+- **(v1.3) Oubli de `WpsModule.ResolveCanClose(...)` après un Busy** → le host reste
+  en attente jusqu'au timeout, puis Kill. Toujours appeler `ResolveCanClose(Ok)` ou
+  `ResolveCanClose(Rejected(...))` quand le travail Busy est fini.
+  Note : pour NeedUser, la résolution est automatique via le mapping host-side
+  USER_RESPONSE — pas besoin d'appeler `ResolveCanClose` manuellement.

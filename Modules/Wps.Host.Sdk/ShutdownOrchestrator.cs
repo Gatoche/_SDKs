@@ -56,9 +56,14 @@ public sealed class ShutdownOrchestrator
     /// si <paramref name="ct"/> a été annulé.
     /// </summary>
     /// <param name="opts">Options de fermeture (timeouts, mode urgent, etc.).</param>
-    /// <param name="onSwitchToTargetForUser">Callback invoqué (sur le UI thread du host) quand
-    /// l'orchestrateur veut basculer sur un target en NEED_USER. Le host doit afficher l'onglet
-    /// du module et lui donner le focus. Reçoit le target en argument pour identification.</param>
+    /// <param name="onShowUserDialog">Callback invoqué (sur le UI thread du host) pour afficher
+    /// la modale de confirmation côté HOST quand un target répond NEED_USER. Reçoit
+    /// <c>(target, reason, question, buttons)</c> et doit retourner la
+    /// <see cref="WpsDialogResult"/> choisie par l'utilisateur. L'orchestrateur transmet ensuite
+    /// le résultat au module via <c>USER_RESPONSE</c>, qui est mappé automatiquement par le SDK
+    /// module en CAN_CLOSE_OK (Yes/Ok) ou CAN_CLOSE_REJECTED (No/Cancel). Le host est libre de
+    /// faire un switch onglet vers le target en plus de l'affichage de la modale, pour le
+    /// contexte visuel.</param>
     /// <param name="progress">Optionnel : reçoit des mises à jour de progression pendant la
     /// séquence (target en cours, état, message). Utile pour un overlay UI dans le host.</param>
     /// <param name="ct">Cancellation pour annuler la séquence (ex: l'utilisateur annule la
@@ -71,7 +76,7 @@ public sealed class ShutdownOrchestrator
     /// Si null, pas de capture — comportement default.</param>
     public async Task<HostShutdownOutcome> ExecuteAsync(
         ShutdownOptions opts,
-        Func<IWpsShutdownTarget, Task> onSwitchToTargetForUser,
+        Func<IWpsShutdownTarget, string, string, WpsDialogButtons, Task<WpsDialogResult>> onShowUserDialog,
         IProgress<ShutdownProgress>? progress = null,
         CancellationToken ct = default,
         Func<IWpsShutdownTarget, Task>? onBeforeTargetClose = null)
@@ -139,38 +144,64 @@ public sealed class ShutdownOrchestrator
             return HostShutdownOutcome.AbortedByModule;
         }
 
-        // ====== Phase 3 : queue NEED_USER séquentielle ======
+        // ====== Phase 3 : queue NEED_USER séquentielle (modale affichée HOST-side) ======
+        // Architecture v1.3 final : le host affiche la modale, pas le module. L'orchestrateur
+        // appelle onShowUserDialog → reçoit WpsDialogResult → envoie USER_RESPONSE au module
+        // (mappage automatique Yes/Ok→Ok, No/Cancel→Rejected côté SDK module). On attend ensuite
+        // la résolution effective via WaitForNeedUserResolutionAsync (qui voit arriver le
+        // CAN_CLOSE_OK ou CAN_CLOSE_REJECTED après que le négociateur module ait appliqué).
         var needUsers = canCloseResults
             .Where(kv => kv.Value is CanCloseResponse.NeedUserR)
-            .Select(kv => (Target: kv.Key, Reason: ((CanCloseResponse.NeedUserR)kv.Value).Reason))
+            .Select(kv => (Target: kv.Key, NeedUser: (CanCloseResponse.NeedUserR)kv.Value))
             .ToList();
-        foreach (var (target, reason) in needUsers)
+        foreach (var (target, nu) in needUsers)
         {
             ct.ThrowIfCancellationRequested();
             WpsDebugSender.Log(
-                $"Phase 3: '{target.Name}' NeedUser ({reason}) — switching tab + focus",
+                $"Phase 3: '{target.Name}' NeedUser (reason='{nu.Reason}', question='{nu.Question}', buttons={nu.Buttons}) — host displays modal",
                 LogLevel.Info, LogTag);
-            progress?.Report(new ShutdownProgress(target, ShutdownPhase.UserInteraction, reason));
+            progress?.Report(new ShutdownProgress(target, ShutdownPhase.UserInteraction, nu.Reason));
 
-            try { await onSwitchToTargetForUser(target).ConfigureAwait(false); }
+            // 1. Affichage de la modale côté host (callback → résultat utilisateur)
+            WpsDialogResult dialogResult;
+            try
+            {
+                dialogResult = await onShowUserDialog(target, nu.Reason, nu.Question, nu.Buttons)
+                    .ConfigureAwait(false);
+            }
             catch (Exception ex)
             {
-                WpsDebugSender.Log($"Phase 3: onSwitchToTargetForUser('{target.Name}') threw {ex.GetType().Name}: {ex.Message}",
+                WpsDebugSender.Log(
+                    $"Phase 3: onShowUserDialog('{target.Name}') threw {ex.GetType().Name}: {ex.Message} — fallback Cancel (Rejected)",
+                    LogLevel.Warning, LogTag);
+                dialogResult = WpsDialogResult.Cancel;
+            }
+            WpsDebugSender.Log(
+                $"Phase 3: '{target.Name}' user clicked {dialogResult} → SendUserResponseAsync",
+                LogLevel.Trace, LogTag);
+
+            // 2. Envoi USER_RESPONSE au module — qui appliquera Ok ou Rejected via son négociateur
+            try
+            {
+                await target.SendUserResponseAsync(dialogResult).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                WpsDebugSender.Log(
+                    $"Phase 3: SendUserResponseAsync('{target.Name}') threw {ex.GetType().Name}: {ex.Message}",
                     LogLevel.Warning, LogTag);
             }
 
-            // Attendre la décision finale (l'utilisateur tranche son dialog Yes/No/Cancel et
-            // l'app appelle ResolveCanClose) via WaitForNeedUserResolutionAsync — méthode
-            // dédiée SANS watchdog silence : l'humain peut prendre tout le temps qu'il veut.
-            // ⚠️ Ne PAS utiliser RequestCanCloseAsync qui timeoute en CanCloseTimeoutMs (3s) —
-            // c'est insuffisant pour un dialog utilisateur, et ça forcerait CLOSE prématuré.
+            // 3. Attendre la résolution effective (CAN_CLOSE_OK ou CAN_CLOSE_REJECTED arrivant
+            // du module après son traitement du USER_RESPONSE). WaitForNeedUserResolutionAsync
+            // n'a pas de watchdog silence (cf. doc).
             var followup = await target.WaitForNeedUserResolutionAsync(opts, ct).ConfigureAwait(false);
             canCloseResults[target] = followup;
 
             if (followup is CanCloseResponse.RejectedR rej)
             {
                 WpsDebugSender.Log(
-                    $"Phase 3: '{target.Name}' REJECTED post-NeedUser ({rej.Reason}) — cascade",
+                    $"Phase 3: '{target.Name}' REJECTED post-USER_RESPONSE ({rej.Reason}) — cascade",
                     LogLevel.Info, LogTag);
                 progress?.Report(new ShutdownProgress(target, ShutdownPhase.Aborted, $"Refus : {rej.Reason}"));
 

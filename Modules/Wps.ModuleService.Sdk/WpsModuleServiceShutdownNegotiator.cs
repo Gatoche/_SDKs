@@ -123,6 +123,37 @@ internal sealed class WpsModuleServiceShutdownNegotiator
         await ApplyDecisionAsync(decision).ConfigureAwait(false);
     }
 
+    /// <summary>(v1.3 final) USER_RESPONSE reçu après que la modale host a été tranchée par
+    /// l'utilisateur. Mapping standard : Yes/Ok → CanCloseDecision.Ok, No/Cancel → Rejected.
+    /// L'app peut court-circuiter en appelant <see cref="WpsModuleService.ResolveCanClose"/>
+    /// avant que USER_RESPONSE n'arrive (cas custom rare) — on vérifie l'état pour ne pas
+    /// écraser une résolution applicative.</summary>
+    public Task OnUserResponseReceived(WpsDialogResult result)
+    {
+        lock (_lock)
+        {
+            if (_state != State.NeedUser)
+            {
+                WpsDebugSender.Log(
+                    $"OnUserResponseReceived ignoré : état={_state} (attendu NeedUser, peut-être déjà résolu par l'app)",
+                    LogLevel.Trace, LogTag);
+                return Task.CompletedTask;
+            }
+        }
+
+        var decision = result switch
+        {
+            WpsDialogResult.Yes or WpsDialogResult.Ok => CanCloseDecision.Ok,
+            WpsDialogResult.No => CanCloseDecision.Rejected("user-no"),
+            WpsDialogResult.Cancel => CanCloseDecision.Rejected("user-cancel"),
+            _ => CanCloseDecision.Ok,
+        };
+        WpsDebugSender.Log(
+            $"USER_RESPONSE reçu ({result}) → {decision.GetType().Name}",
+            LogLevel.Info, LogTag);
+        return ApplyDecisionAsync(decision);
+    }
+
     /// <summary>CAN_CLOSE_ABORTED reçu : libère le verrou Locked → Idle, notifie l'app.</summary>
     public void OnCanCloseAborted()
     {
@@ -268,9 +299,10 @@ internal sealed class WpsModuleServiceShutdownNegotiator
 
             case CanCloseDecision.NeedUserD needUser:
                 lock (_lock) _state = State.NeedUser;
-                await _connection.SendCanCloseNeedUserAsync(needUser.Reason).ConfigureAwait(false);
+                await _connection.SendCanCloseNeedUserAsync(needUser.Reason, needUser.Question, needUser.Buttons)
+                    .ConfigureAwait(false);
                 WpsDebugSender.Log(
-                    $"CAN_CLOSE_NEED_USER sent (reason='{needUser.Reason}')",
+                    $"CAN_CLOSE_NEED_USER sent (reason='{needUser.Reason}', question='{needUser.Question}', buttons={needUser.Buttons}) — host will display the modal",
                     LogLevel.Trace, LogTag);
                 break;
 

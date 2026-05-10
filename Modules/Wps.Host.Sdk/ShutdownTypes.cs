@@ -69,10 +69,13 @@ public abstract record CanCloseResponse
     /// + un nouveau CAN_CLOSE_OK final. Si silence &gt; <c>BusyHeartbeatTimeoutMs</c>, Kill.</summary>
     public sealed record BusyR(int EstimatedMs, string Reason) : CanCloseResponse;
 
-    /// <summary>Module veut afficher un dialog à l'utilisateur. L'orchestrateur bascule l'onglet
-    /// sur ce module (callback fourni au constructeur) et attend la décision finale via un
-    /// nouveau cycle CanCloseOk / CanCloseRejected.</summary>
-    public sealed record NeedUserR(string Reason) : CanCloseResponse;
+    /// <summary>(v1.3 final) Module veut une confirmation utilisateur. Le HOST affiche la
+    /// modale (callback <c>onShowUserDialog</c> de l'orchestrateur) avec
+    /// <paramref name="Question"/> et <paramref name="Buttons"/> ; <paramref name="Reason"/>
+    /// est utilisé en sous-titre / contexte. Le résultat est ensuite renvoyé au module via
+    /// <c>USER_RESPONSE</c> qui mappe automatiquement en CAN_CLOSE_OK ou CAN_CLOSE_REJECTED.</summary>
+    public sealed record NeedUserR(string Reason, string Question, WpsDialogButtons Buttons)
+        : CanCloseResponse;
 
     /// <summary>Utilisateur a refusé la fermeture. L'orchestrateur annule sa fermeture en
     /// cascade (SendCanCloseAbortedAsync sur tous les modules déjà OK).</summary>
@@ -86,8 +89,8 @@ public abstract record CanCloseResponse
     public static readonly CanCloseResponse Timeout = new TimeoutR();
     public static CanCloseResponse Busy(int estimatedMs, string reason)
         => new BusyR(estimatedMs, reason ?? "");
-    public static CanCloseResponse NeedUser(string reason)
-        => new NeedUserR(reason ?? "");
+    public static CanCloseResponse NeedUser(string reason, string question, WpsDialogButtons buttons)
+        => new NeedUserR(reason ?? "", question ?? "", buttons);
     public static CanCloseResponse Rejected(string reason)
         => new RejectedR(reason ?? "");
 }
@@ -174,15 +177,21 @@ public interface IWpsShutdownTarget
     /// avoir reçu CAN_CLOSE_ABORTED).</summary>
     Task SendCanCloseAbortedAsync();
 
+    /// <summary>(v1.3 final) Envoie USER_RESPONSE|result au module en réponse à un NeedUser.
+    /// Le négociateur côté module mappe Yes/Ok → Ok, No/Cancel → Rejected automatiquement.
+    /// Appelé par l'orchestrateur après que la modale host a été tranchée par l'utilisateur.</summary>
+    Task SendUserResponseAsync(WpsDialogResult result);
+
     /// <summary>Phase finale : envoie CLOSE, attend CLOSING_DONE, fallback Kill si timeout.</summary>
     Task<ShutdownResult> CompleteShutdownAsync(ShutdownOptions opts, System.Threading.CancellationToken ct);
 
     /// <summary>Émis pendant un Busy : permet à l'orchestrateur d'afficher la progression.</summary>
     event Action<HostBusyProgress>? BusyProgressChanged;
 
-    /// <summary>Émis quand le module signale NeedUser (si pas déjà reçu via RequestCanCloseAsync).
-    /// Utile pour le pattern où le module passe Busy puis bascule en NeedUser.</summary>
-    event Action<string>? NeedUserSignaled;
+    /// <summary>(v1.3 final) Émis quand le module signale NeedUser (si pas déjà reçu via
+    /// RequestCanCloseAsync). Utile pour le pattern où le module passe Busy puis bascule en
+    /// NeedUser. Args : <c>reason</c>, <c>question</c>, <c>buttons</c>.</summary>
+    event Action<string, string, WpsDialogButtons>? NeedUserSignaled;
 
     /// <summary>Émis si le process meurt pendant la séquence (pipe coupé, Process.Exited).
     /// L'orchestrateur peut court-circuiter le wait du CLOSING_DONE.</summary>

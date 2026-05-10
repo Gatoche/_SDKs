@@ -48,8 +48,10 @@ internal sealed class WpsHostConnection : IDisposable
     /// <summary>(v1.3) Émis à réception de <c>CAN_CLOSE_BUSY|estimatedMs|reason</c>.</summary>
     public event Action<int, string>? CanCloseBusy;
 
-    /// <summary>(v1.3) Émis à réception de <c>CAN_CLOSE_NEED_USER|reason</c>.</summary>
-    public event Action<string>? CanCloseNeedUser;
+    /// <summary>(v1.3 final) Émis à réception de <c>CAN_CLOSE_NEED_USER|reason|question|buttons</c>.
+    /// Le HOST est responsable d'afficher la modale et de renvoyer le résultat via
+    /// <see cref="SendUserResponseAsync"/>.</summary>
+    public event Action<string, string, WpsDialogButtons>? CanCloseNeedUser;
 
     /// <summary>(v1.3) Émis à réception de <c>CAN_CLOSE_REJECTED|reason</c>.</summary>
     public event Action<string>? CanCloseRejected;
@@ -99,6 +101,13 @@ internal sealed class WpsHostConnection : IDisposable
     /// fonctionnement normal et l'app reçoit <c>OnCanCloseAborted</c>.</summary>
     public Task SendCanCloseAbortedAsync() =>
         _duplex.SendAsync(WpsModuleContract.CmdCanCloseAborted);
+
+    /// <summary>(v1.3 final) Envoie <c>USER_RESPONSE|result</c> au module en réponse à un
+    /// <see cref="CanCloseNeedUser"/> précédemment reçu. Le négociateur côté module mappe
+    /// <c>Yes</c>/<c>Ok</c> en <c>CAN_CLOSE_OK</c> et <c>No</c>/<c>Cancel</c> en
+    /// <c>CAN_CLOSE_REJECTED</c> automatiquement.</summary>
+    public Task SendUserResponseAsync(WpsDialogResult result) =>
+        _duplex.SendAsync($"{WpsModuleContract.CmdUserResponse}{WpsModuleContract.Separator}{result}");
 
     /// <summary>(v1.2, ModuleService) Envoie INVOKE|requestId|method|jsonParams au peer.
     /// La réponse arrivera asynchrone via <see cref="InvokeResultReceived"/> avec le même
@@ -177,8 +186,26 @@ internal sealed class WpsHostConnection : IDisposable
         }
         if (line.StartsWith(WpsModuleContract.NotifCanCloseNeedUser + WpsModuleContract.Separator, StringComparison.Ordinal))
         {
-            var p = line.Split(WpsModuleContract.Separator, 2);
-            if (p.Length >= 2) CanCloseNeedUser?.Invoke(p[1]);
+            // Format v1.3 final : CAN_CLOSE_NEED_USER|reason|question|buttons (4 parts).
+            // reason et question sont encodés via EncodeLineSafe côté module — on décode ici
+            // pour restituer les \n originaux.
+            var p = line.Split(WpsModuleContract.Separator, 4);
+            if (p.Length >= 4)
+            {
+                var reason = WpsModuleContract.DecodeLineSafe(p[1]);
+                var question = WpsModuleContract.DecodeLineSafe(p[2]);
+                if (Enum.TryParse<WpsDialogButtons>(p[3], ignoreCase: false, out var buttons))
+                {
+                    CanCloseNeedUser?.Invoke(reason, question, buttons);
+                }
+                else
+                {
+                    WpsDebugSender.Log(
+                        $"NotifCanCloseNeedUser: buttons inconnu '{p[3]}' — fallback YesNoCancel",
+                        LogLevel.Warning, LogTag);
+                    CanCloseNeedUser?.Invoke(reason, question, WpsDialogButtons.YesNoCancel);
+                }
+            }
             return;
         }
         if (line.StartsWith(WpsModuleContract.NotifCanCloseRejected + WpsModuleContract.Separator, StringComparison.Ordinal))

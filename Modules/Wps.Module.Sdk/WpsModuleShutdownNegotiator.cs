@@ -189,6 +189,48 @@ internal sealed class WpsModuleShutdownNegotiator
     }
 
     /// <summary>
+    /// (v1.3 final) Appelé quand le host envoie USER_RESPONSE après que sa modale a été
+    /// tranchée par l'utilisateur. Mapping standard :
+    /// <list type="bullet">
+    ///   <item><see cref="WpsDialogResult.Yes"/> ou <see cref="WpsDialogResult.Ok"/>
+    ///         → <see cref="CanCloseDecision.Ok"/></item>
+    ///   <item><see cref="WpsDialogResult.No"/> ou <see cref="WpsDialogResult.Cancel"/>
+    ///         → <see cref="CanCloseDecision.Rejected"/></item>
+    /// </list>
+    /// <para>Si l'app veut un mapping custom (rare), elle peut court-circuiter en appelant
+    /// elle-même <see cref="WpsModule.ResolveCanClose"/> avant que USER_RESPONSE n'arrive
+    /// — la state machine accepte n'importe quelle décision tant qu'on est en NeedUser.
+    /// On vérifie l'état avant le mapping pour ne pas écraser une résolution applicative.</para>
+    /// </summary>
+    public Task OnUserResponseReceived(WpsDialogResult result)
+    {
+        lock (_lock)
+        {
+            // Si l'app a déjà résolu de son côté (cas rare : NeedUser custom + ResolveCanClose
+            // avant que USER_RESPONSE n'arrive), on ne touche plus à l'état.
+            if (_state != State.NeedUser)
+            {
+                WpsDebugSender.Log(
+                    $"OnUserResponseReceived ignoré : état={_state} (attendu NeedUser, peut-être déjà résolu par l'app)",
+                    LogLevel.Trace, LogTag);
+                return Task.CompletedTask;
+            }
+        }
+
+        var decision = result switch
+        {
+            WpsDialogResult.Yes or WpsDialogResult.Ok => CanCloseDecision.Ok,
+            WpsDialogResult.No => CanCloseDecision.Rejected("user-no"),
+            WpsDialogResult.Cancel => CanCloseDecision.Rejected("user-cancel"),
+            _ => CanCloseDecision.Ok,  // défensif
+        };
+        WpsDebugSender.Log(
+            $"USER_RESPONSE reçu ({result}) → {decision.GetType().Name}",
+            LogLevel.Info, LogTag);
+        return ApplyDecisionAsync(decision);
+    }
+
+    /// <summary>
     /// Appelé quand le host envoie CAN_CLOSE_ABORTED (cascade annulée par un autre module qui
     /// a renvoyé Rejected). Libère le verrou interne (état Locked → Idle) et notifie le hook
     /// applicatif <see cref="IWpsModule.OnCanCloseAborted"/>. Idempotent si l'état n'est pas
@@ -322,9 +364,10 @@ internal sealed class WpsModuleShutdownNegotiator
 
             case CanCloseDecision.NeedUserD needUser:
                 lock (_lock) _state = State.NeedUser;
-                await _connection.SendCanCloseNeedUserAsync(needUser.Reason).ConfigureAwait(false);
+                await _connection.SendCanCloseNeedUserAsync(needUser.Reason, needUser.Question, needUser.Buttons)
+                    .ConfigureAwait(false);
                 WpsDebugSender.Log(
-                    $"CAN_CLOSE_NEED_USER sent (reason='{needUser.Reason}')",
+                    $"CAN_CLOSE_NEED_USER sent (reason='{needUser.Reason}', question='{needUser.Question}', buttons={needUser.Buttons}) — host will display the modal",
                     LogLevel.Trace, LogTag);
                 break;
 

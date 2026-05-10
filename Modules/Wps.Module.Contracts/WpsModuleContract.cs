@@ -35,8 +35,9 @@ public enum WpsModuleKind
 ///   réponses CAN_CLOSE_OK / CAN_CLOSE_BUSY / CAN_CLOSE_NEED_USER / CAN_CLOSE_REJECTED,
 ///   CAN_CLOSE_ABORTED (libère le verrou si la fermeture est annulée par cascade), CLOSING_DONE
 ///   (fin de cleanup côté module avant exit), BUSY_PROGRESS (mise à jour pendant un BUSY long),
-///   SELF_CLOSING (module se ferme à son initiative). Permet la négociation d'arrêt avec veto
-///   utilisateur, intervention applicative en NEED_USER, et grace timeouts confortables — additif
+///   SELF_CLOSING (module se ferme à son initiative). USER_RESPONSE (Host → Module : résultat
+///   de la modale NEED_USER, le host est responsable de l'affichage). Permet la négociation
+///   d'arrêt avec veto utilisateur, et grace timeouts confortables — additif
 /// </summary>
 public static class WpsModuleContract
 {
@@ -48,6 +49,30 @@ public static class WpsModuleContract
 
     /// <summary>Séparateur de champs dans les messages texte sur les pipes.</summary>
     public const char Separator = '|';
+
+    /// <summary>Caractère substituant pour les newlines dans les payloads texte. Le wire-protocol
+    /// est line-delimited (chaque message = une ligne sur le pipe) — un <c>\n</c> dans un payload
+    /// le casserait en deux trames distinctes. <see cref="EncodeLineSafe"/> remplace les <c>\n</c>
+    /// par ce caractère US (Unit Separator, U+001E) ; <see cref="DecodeLineSafe"/> fait l'inverse
+    /// côté récepteur. Choix de U+001E parce qu'il est <i>strictement</i> non-imprimable et
+    /// jamais présent dans un texte applicatif normal.</summary>
+    public const char NewlineEscape = '';
+
+    /// <summary>Encode un payload texte pour transit sûr sur le pipe line-delimited : remplace
+    /// les retours chariot (CR/LF, CRLF, LF) par <see cref="NewlineEscape"/>. À appliquer côté
+    /// expéditeur sur tous les champs susceptibles de contenir des newlines (question dialog
+    /// multi-ligne, reason avec description longue, etc.). Idempotent sur du texte single-line.
+    /// <para>Note : le séparateur de champs <c>|</c> n'est PAS encodé — par convention, les
+    /// payloads ne doivent pas en contenir, soit la dernière portion d'une trame est lue avec
+    /// <c>Split(Separator, count)</c> qui préserve les <c>|</c> du reste.</para></summary>
+    public static string EncodeLineSafe(string? s)
+        => s is null ? "" : s.Replace("\r\n", "\n").Replace('\r', NewlineEscape).Replace('\n', NewlineEscape);
+
+    /// <summary>Decode un payload encodé via <see cref="EncodeLineSafe"/> : remplace les
+    /// <see cref="NewlineEscape"/> par <c>\n</c>. À appliquer côté récepteur sur les champs
+    /// concernés.</summary>
+    public static string DecodeLineSafe(string? s)
+        => s is null ? "" : s.Replace(NewlineEscape, '\n');
 
     /// <summary>Conventions de noms des ressources nommées (pipes, shared memory) par session.</summary>
     public static class IpcNames
@@ -162,6 +187,18 @@ public static class WpsModuleContract
     /// le module n'était pas en état locked, le message est ignoré (idempotent).</para></summary>
     public const string CmdCanCloseAborted = "CAN_CLOSE_ABORTED";
 
+    /// <summary>(v1.3) Résultat de la modale affichée côté HOST en réponse à un
+    /// <see cref="NotifCanCloseNeedUser"/>. Format : <c>USER_RESPONSE|result</c> où
+    /// <c>result</c> est le nom de la valeur <see cref="WpsDialogResult"/> (ex: <c>Yes</c>,
+    /// <c>No</c>, <c>Cancel</c>, <c>Ok</c>).
+    /// <para>Architecture : la modale est affichée par le host (style cohérent + service
+    /// console pure compatible nativement). Le SDK module reçoit ce message et résout
+    /// automatiquement le cycle CAN_CLOSE : <c>Yes</c>/<c>Ok</c> → <c>CAN_CLOSE_OK</c>,
+    /// <c>No</c>/<c>Cancel</c> → <c>CAN_CLOSE_REJECTED</c>. L'app peut hooker via une DIM
+    /// optionnelle pour customiser le mapping (ex: traiter <c>Cancel</c> comme un Busy
+    /// "sauvegarde en cours" plutôt qu'un refus net).</para></summary>
+    public const string CmdUserResponse = "USER_RESPONSE";
+
     // ====== Vocabulaire v1.3 Module → Host ======
 
     /// <summary>(v1.3) Réponse OK au CAN_CLOSE : le module est libre, il peut fermer.
@@ -182,14 +219,26 @@ public static class WpsModuleContract
     /// la dernière portion de trame, reconstruite via string.Join côté parser).</summary>
     public const string NotifCanCloseBusy = "CAN_CLOSE_BUSY";
 
-    /// <summary>(v1.3) Réponse NEED_USER au CAN_CLOSE : le module a besoin d'une interaction
-    /// utilisateur (dialog "voulez-vous sauvegarder ?", confirmation, etc.). Le host bascule
-    /// l'onglet sur ce module + lui donne le focus clavier (<c>SetFocus</c> sur le HWND
-    /// embarqué, pas <c>SetForegroundWindow</c> qui est restreint cross-process). Le module
-    /// gère son dialog ; quand l'user a tranché, il renvoie <see cref="NotifCanCloseOk"/>
-    /// ou <see cref="NotifCanCloseRejected"/>.
-    /// Format : <c>CAN_CLOSE_NEED_USER|reason</c> où <c>reason</c> est affiché par le host
-    /// dans son overlay pendant le basculement (peut contenir des <c>|</c>).
+    /// <summary>(v1.3) Réponse NEED_USER au CAN_CLOSE : le module a besoin d'une confirmation
+    /// utilisateur. Le HOST affiche la modale (pas le module) — le module ne fait que
+    /// déclarer la <c>question</c> et les <c>buttons</c> ; le host appelle MessageBox.Show
+    /// dans son propre process et renvoie le résultat via <see cref="CmdUserResponse"/>.
+    /// <para>Format : <c>CAN_CLOSE_NEED_USER|reason|question|buttons</c> où :</para>
+    /// <list type="bullet">
+    ///   <item><c>reason</c> : sous-titre / contexte (ex: "Document non sauvegardé"). Utilisé
+    ///         dans le titre de la modale ou en zone détails côté host.</item>
+    ///   <item><c>question</c> : question principale affichée à l'utilisateur (ex: "Voulez-
+    ///         vous fermer sans sauvegarder ?").</item>
+    ///   <item><c>buttons</c> : nom de la valeur <see cref="WpsDialogButtons"/> (ex:
+    ///         <c>YesNoCancel</c>, <c>OkCancel</c>).</item>
+    /// </list>
+    /// <para><c>question</c> ne peut pas contenir de <c>|</c> littéral — utiliser un escape
+    /// applicatif si nécessaire (typiquement les questions courantes n'en contiennent pas).
+    /// <c>reason</c> et <c>buttons</c> sont strictement contraints (textes courts / enum).</para>
+    /// <para><b>Avantages</b> de l'affichage host-side : (1) services console pures
+    /// compatibles sans Application WPF, (2) pas de focus war cross-process (modale dans
+    /// le même process que le host), (3) style cohérent host, (4) sérialisation auto
+    /// quand N modules répondent NeedUser.</para>
     /// <para>Si <c>isUrgent=1</c> dans le CAN_CLOSE entrant, le SDK module clamp NeedUser
     /// en Busy automatiquement — pas de dialog pendant un shutdown OS.</para></summary>
     public const string NotifCanCloseNeedUser = "CAN_CLOSE_NEED_USER";

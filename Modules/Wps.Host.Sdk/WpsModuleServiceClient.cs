@@ -82,7 +82,7 @@ public sealed class WpsModuleServiceClient : IDisposable, IWpsShutdownTarget
 
     /// <summary>(v1.3) Émis si le service signale NEED_USER en cours de séquence (rare côté
     /// ModuleService — plutôt typique d'une settings window ouverte ad hoc).</summary>
-    public event Action<string>? NeedUserSignaled;
+    public event Action<string, string, WpsDialogButtons>? NeedUserSignaled;
 
     /// <summary>(v1.3) Émis quand le service se ferme à son initiative (SELF_CLOSING reçu).</summary>
     public event Action<string>? SelfClosing;
@@ -145,8 +145,8 @@ public sealed class WpsModuleServiceClient : IDisposable, IWpsShutdownTarget
         // (v1.3) Republie les events de la connexion vers les events publics du client.
         _connection.BusyProgressReceived += (percent, msg) =>
             BusyProgressChanged?.Invoke(new HostBusyProgress(percent, msg));
-        _connection.CanCloseNeedUser += reason =>
-            NeedUserSignaled?.Invoke(reason);
+        _connection.CanCloseNeedUser += (reason, question, buttons) =>
+            NeedUserSignaled?.Invoke(reason, question, buttons);
         _connection.SelfClosing += reason =>
             SelfClosing?.Invoke(reason);
 
@@ -296,7 +296,8 @@ public sealed class WpsModuleServiceClient : IDisposable, IWpsShutdownTarget
         var tcs = new TaskCompletionSource<CanCloseResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
         Action onOk = () => tcs.TrySetResult(CanCloseResponse.Ok);
         Action<int, string> onBusy = (estMs, reason) => tcs.TrySetResult(CanCloseResponse.Busy(estMs, reason));
-        Action<string> onNeedUser = reason => tcs.TrySetResult(CanCloseResponse.NeedUser(reason));
+        Action<string, string, WpsDialogButtons> onNeedUser = (reason, question, buttons) =>
+            tcs.TrySetResult(CanCloseResponse.NeedUser(reason, question, buttons));
         Action<string> onRejected = reason => tcs.TrySetResult(CanCloseResponse.Rejected(reason));
 
         _connection.CanCloseOk += onOk;
@@ -328,6 +329,13 @@ public sealed class WpsModuleServiceClient : IDisposable, IWpsShutdownTarget
     {
         if (_disposed || _connection is null) return Task.CompletedTask;
         return _connection.SendCanCloseAbortedAsync();
+    }
+
+    /// <inheritdoc cref="IWpsShutdownTarget.SendUserResponseAsync"/>
+    public Task SendUserResponseAsync(WpsDialogResult result)
+    {
+        if (_disposed || _connection is null) return Task.CompletedTask;
+        return _connection.SendUserResponseAsync(result);
     }
 
     /// <inheritdoc cref="WpsModuleSlot.CompleteShutdownAsync"/>
@@ -420,7 +428,8 @@ public sealed class WpsModuleServiceClient : IDisposable, IWpsShutdownTarget
 
         Action onOk = () => tcs.TrySetResult(CanCloseResponse.Ok);
         Action<int, string> onBusyAgain = (_, _) => lastSignalUtc = DateTime.UtcNow;
-        Action<string> onNeedUser = reason => tcs.TrySetResult(CanCloseResponse.NeedUser(reason));
+        Action<string, string, WpsDialogButtons> onNeedUser = (reason, question, buttons) =>
+            tcs.TrySetResult(CanCloseResponse.NeedUser(reason, question, buttons));
         Action<string> onRejected = reason => tcs.TrySetResult(CanCloseResponse.Rejected(reason));
         Action<int, string> onProgress = (_, _) => lastSignalUtc = DateTime.UtcNow;
         Action onProcessExited = () => tcs.TrySetResult(CanCloseResponse.Timeout);
