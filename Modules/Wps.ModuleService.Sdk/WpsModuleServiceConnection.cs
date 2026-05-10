@@ -7,15 +7,20 @@ namespace Wps.ModuleService;
 
 /// <summary>
 /// Connexion IPC côté ModuleService. Symétrique à <c>WpsModuleConnection</c> (côté Module classique)
-/// mais headless : pas de Dispatcher WPF, pas de gestion RESIZE/READY|hwnd. Annonce le Kind
-/// <see cref="WpsModuleKind.ModuleService"/> dans le HELLO et dispatche les nouveaux messages
-/// <c>INVOKE</c> / <c>SHOW_SETTINGS</c> du contrat 1.2.
+/// mais headless : pas de Dispatcher WPF obligatoire, pas de gestion RESIZE/READY|hwnd. Annonce
+/// le Kind <see cref="WpsModuleKind.ModuleService"/> dans le HELLO et dispatche les nouveaux
+/// messages <c>INVOKE</c> / <c>SHOW_SETTINGS</c> du contrat 1.2 + le shutdown négocié v1.3
+/// (<c>CAN_CLOSE</c> / <c>CAN_CLOSE_ABORTED</c>) via <see cref="WpsModuleServiceShutdownNegotiator"/>.
 ///
-/// Les handlers Invoke sont enregistrés via <see cref="RegisterInvokeHandler"/> (string method name
-/// → async handler). Pour chaque INVOKE reçu, on cherche le handler correspondant, on désérialise
-/// le payload JSON en <c>JsonElement</c>, on appelle le handler, on sérialise le résultat et on
-/// répond INVOKE_RESULT|requestId|OK|jsonResult. En cas d'exception ou de handler manquant, on
-/// répond INVOKE_RESULT|requestId|ERROR|message.
+/// <para>Les handlers Invoke sont enregistrés via <see cref="RegisterInvokeHandler"/> (string
+/// method name → async handler). Pour chaque INVOKE reçu, on cherche le handler correspondant,
+/// on désérialise le payload JSON en <c>JsonElement</c>, on appelle le handler, on sérialise le
+/// résultat et on répond INVOKE_RESULT|requestId|OK|jsonResult. En cas d'exception ou de handler
+/// manquant, on répond INVOKE_RESULT|requestId|ERROR|message.</para>
+///
+/// <para><b>v1.3 :</b> tracking <see cref="LastPingReceivedUtc"/> pour le watchdog "host figé"
+/// implémenté côté <see cref="WpsModuleService"/>. Send methods pour les nouvelles notifications
+/// (CAN_CLOSE_OK/BUSY/NEED_USER/REJECTED, BUSY_PROGRESS, CLOSING_DONE, SELF_CLOSING).</para>
 /// </summary>
 internal sealed class WpsModuleServiceConnection : IDisposable
 {
@@ -31,15 +36,31 @@ internal sealed class WpsModuleServiceConnection : IDisposable
     // n'expose pas de paramétrage).
     private Action? _showSettingsHandler;
 
+    /// <summary>(v1.3) Négociateur shutdown attaché après création (cf. <see cref="AttachNegotiator"/>).</summary>
+    private WpsModuleServiceShutdownNegotiator? _negotiator;
+
     private readonly TaskCompletionSource<string> _welcomeTcs =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    /// <summary>(v1.3) Timestamp UTC du dernier PING reçu — pour watchdog "host figé".</summary>
+    public DateTime LastPingReceivedUtc { get; private set; } = DateTime.UtcNow;
+
+    /// <summary>Expose le pipe duplex pour permettre à <see cref="WpsModuleService"/> de
+    /// s'abonner à <see cref="WpsPipeDuplex.Closed"/> et déclencher
+    /// <see cref="IWpsModule.OnHostDisconnected"/>(PipeClosed).</summary>
+    public WpsPipeDuplex Duplex => _duplex;
+
     /// <summary>Émis quand le pipe est coupé par le Host (EOF). Le caller (typiquement le main
-    /// du service console) peut s'en servir pour sortir de RunAsync.</summary>
+    /// du service console) peut s'en servir pour sortir de RunAsync. Préservé pour rétrocompat
+    /// avec les services existants (TracePML, etc.) — en v1.3 préférer
+    /// <see cref="IWpsModule.OnHostDisconnected"/>.</summary>
     public event Action? PipeClosed;
 
-    /// <summary>Émis quand le Host envoie CLOSE (shutdown propre). Le caller doit terminer
-    /// son travail en cours et sortir.</summary>
+    /// <summary>Émis quand le Host envoie CLOSE (shutdown propre). Le caller doit terminer son
+    /// travail en cours et sortir. Préservé pour rétrocompat (TracePML utilise cet event
+    /// directement). En v1.3, le négociateur intercepte CLOSE en premier pour faire passer le
+    /// hook applicatif <see cref="IWpsModule.OnShutdownRequested"/> + envoyer CLOSING_DONE — ce
+    /// vieil event est levé en complément pour les services qui n'utilisent pas l'interface.</summary>
     public event Action? ShutdownRequested;
 
     private const string LogTag = "Wps.ModuleService.Sdk";
@@ -56,6 +77,10 @@ internal sealed class WpsModuleServiceConnection : IDisposable
         _duplex.LineReceived += Dispatch;
         _duplex.Closed += () => PipeClosed?.Invoke();
     }
+
+    /// <summary>Attache le négociateur de shutdown (création différée pour résoudre la
+    /// dépendance circulaire). Appelé par <see cref="WpsModuleService.BootstrapAsync"/>.</summary>
+    public void AttachNegotiator(WpsModuleServiceShutdownNegotiator negotiator) => _negotiator = negotiator;
 
     public Task StartAsync(CancellationToken ct = default) => _duplex.StartAsync(ct);
 
@@ -84,6 +109,33 @@ internal sealed class WpsModuleServiceConnection : IDisposable
 
     public void SetShowSettingsHandler(Action handler) => _showSettingsHandler = handler;
 
+    // ====== v1.3 : envois Module → Host ======
+
+    public Task SendCanCloseOkAsync() =>
+        _duplex.SendAsync(WpsModuleContract.NotifCanCloseOk);
+
+    public Task SendCanCloseBusyAsync(int estimatedMs, string reason) =>
+        _duplex.SendAsync(FormattableString.Invariant(
+            $"{WpsModuleContract.NotifCanCloseBusy}{WpsModuleContract.Separator}{estimatedMs}{WpsModuleContract.Separator}{reason ?? ""}"));
+
+    public Task SendCanCloseNeedUserAsync(string reason) =>
+        _duplex.SendAsync($"{WpsModuleContract.NotifCanCloseNeedUser}{WpsModuleContract.Separator}{reason ?? ""}");
+
+    public Task SendCanCloseRejectedAsync(string reason) =>
+        _duplex.SendAsync($"{WpsModuleContract.NotifCanCloseRejected}{WpsModuleContract.Separator}{reason ?? ""}");
+
+    public Task SendBusyProgressAsync(int percent, string message) =>
+        _duplex.SendAsync(FormattableString.Invariant(
+            $"{WpsModuleContract.NotifBusyProgress}{WpsModuleContract.Separator}{percent}{WpsModuleContract.Separator}{message ?? ""}"));
+
+    public Task SendClosingDoneAsync() =>
+        _duplex.SendAsync(WpsModuleContract.NotifClosingDone);
+
+    public Task SendSelfClosingAsync(string reason) =>
+        _duplex.SendAsync($"{WpsModuleContract.NotifSelfClosing}{WpsModuleContract.Separator}{reason ?? ""}");
+
+    // ====== Dispatch des messages reçus du host ======
+
     private void Dispatch(string line)
     {
         // ⚠️ Pour CmdInvoke : le payload JSON peut contenir des '|' → on doit limiter le split
@@ -103,10 +155,17 @@ internal sealed class WpsModuleServiceConnection : IDisposable
                 break;
 
             case WpsModuleContract.CmdClose:
+                // v1.3 : si négociateur attaché, route via la state machine (qui appellera
+                // OnShutdownRequested + enverra CLOSING_DONE proprement). Lever AUSSI l'event
+                // legacy ShutdownRequested pour les services qui ne sont pas portés v1.3 (ex:
+                // TracePML qui s'abonne directement à cet event dans son App.xaml.cs).
+                if (_negotiator is not null)
+                    _ = _negotiator.OnCloseReceivedAsync();
                 ShutdownRequested?.Invoke();
                 break;
 
             case WpsModuleContract.CmdPing:
+                LastPingReceivedUtc = DateTime.UtcNow;  // (v1.3) reset watchdog "host figé"
                 // Pas de UI thread à sonder côté ModuleService console : on répond PONG direct
                 // depuis le ReadLoop. Si le service a un workload bloquant qui occupe le pipe
                 // d'écoute, le PONG ne sortira pas → c'est un signal "non réactif" légitime.
@@ -120,6 +179,24 @@ internal sealed class WpsModuleServiceConnection : IDisposable
                     WpsDebugSender.Log($"ShowSettings handler threw {ex.GetType().Name}: {ex.Message}",
                         LogLevel.Warning, LogTag);
                 }
+                break;
+
+            // ====== v1.3 : nouveaux messages ======
+
+            case WpsModuleContract.CmdCanClose:
+                {
+                    var isUrgent = parts.Length >= 2 && parts[1] == "1";
+                    var ctx = new CanCloseContext { IsUrgent = isUrgent };
+                    if (_negotiator is not null)
+                        _ = _negotiator.OnCanCloseReceivedAsync(ctx);
+                    else
+                        // Pas de négociateur : on répond Ok pour ne pas bloquer
+                        _ = SendCanCloseOkAsync();
+                }
+                break;
+
+            case WpsModuleContract.CmdCanCloseAborted:
+                _negotiator?.OnCanCloseAborted();
                 break;
         }
     }

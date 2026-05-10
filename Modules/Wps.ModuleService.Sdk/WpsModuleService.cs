@@ -1,7 +1,9 @@
 using System.Reflection;
 using System.Text.Json;
 using System.Windows;
+using Microsoft.Win32;
 using Wps.Module;
+using Wps.Module.Core;
 
 namespace Wps.ModuleService;
 
@@ -25,17 +27,32 @@ namespace Wps.ModuleService;
 /// }
 /// </code>
 ///
-/// Détection de mode (standalone vs embedded) via le flag <c>--wps-session</c> dans args.
+/// <para>Détection de mode (standalone vs embedded) via le flag <c>--wps-session</c> dans args.
 /// En standalone : <see cref="BootstrapAsync"/> retourne immédiatement, les Register* sont
-/// no-op, <see cref="RunAsync"/> bloque jusqu'à Ctrl+C — utile pour tester le service
-/// en isolation (avec un harness qui injecte des appels directs).
+/// no-op, <see cref="RunAsync"/> bloque jusqu'à Ctrl+C — utile pour tester le service en
+/// isolation (avec un harness qui injecte des appels directs).</para>
+///
+/// <para><b>v1.3 :</b> support du shutdown négocié (CAN_CLOSE/CLOSING_DONE), hook
+/// <c>SessionEnding</c> Windows pour le mode shutdown OS, watchdog "host figé" (silence PING
+/// &gt; 30s), détection coupure pipe. APIs publiques supplémentaires :
+/// <see cref="Register"/> (hook lifecycle <see cref="IWpsModule"/>),
+/// <see cref="ReportBusyProgress"/>, <see cref="NotifySelfClosing"/>,
+/// <see cref="ResolveCanClose"/>.</para>
 /// </summary>
 public static class WpsModuleService
 {
+    private const int HEARTBEAT_SILENCE_TIMEOUT_SECONDS = 30;
+    private const int HEARTBEAT_WATCHDOG_PERIOD_SECONDS = 5;
+
     private static WpsModuleServiceConnection? _connection;
+    private static WpsModuleServiceShutdownNegotiator? _negotiator;
+    private static IWpsModule? _module;
     private static string _logTag = "Wps.ModuleService.Sdk";
     private static readonly TaskCompletionSource<bool> _shutdownTcs =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private static System.Threading.Timer? _heartbeatWatchdog;
+    private static bool _hostDisconnected;  // idempotence
 
     /// <summary>Mode courant : <c>true</c> si lancé par un host (sessionId présent dans args).</summary>
     public static bool IsEmbedded { get; private set; }
@@ -45,8 +62,9 @@ public static class WpsModuleService
 
     /// <summary>
     /// Initialise le SDK : parse les args, ouvre les pipes IPC, fait le handshake HELLO/WELCOME
-    /// avec <see cref="WpsModuleKind.ModuleService"/>. À appeler en début de Main avant d'enregistrer
-    /// les handlers Invoke.
+    /// avec <see cref="WpsModuleKind.ModuleService"/>, attache le négociateur de shutdown v1.3,
+    /// démarre le watchdog heartbeat et le hook SessionEnding Windows. À appeler en début de
+    /// Main avant d'enregistrer les handlers Invoke.
     /// </summary>
     public static async Task BootstrapAsync(string[] args)
     {
@@ -64,6 +82,14 @@ public static class WpsModuleService
         try
         {
             _connection = new WpsModuleServiceConnection(SessionId);
+
+            // (v1.3) Négociateur de shutdown : créé après la connexion (dépendance circulaire).
+            _negotiator = new WpsModuleServiceShutdownNegotiator(_module, _connection);
+            _connection.AttachNegotiator(_negotiator);
+
+            // Events legacy ShutdownRequested / PipeClosed conservés pour rétrocompat (services
+            // pré-v1.3 comme TracePML qui s'y abonnent directement). En v1.3 le négociateur les
+            // double avec le hook applicatif IWpsModule.OnShutdownRequested.
             _connection.ShutdownRequested += () =>
             {
                 WpsDebugSender.Log($"CLOSE reçu du host → fin de RunAsync", LogLevel.Info, _logTag);
@@ -72,6 +98,9 @@ public static class WpsModuleService
             _connection.PipeClosed += () =>
             {
                 WpsDebugSender.Log($"pipe coupé par le host (EOF) → fin de RunAsync", LogLevel.Info, _logTag);
+                // (v1.3) Trigger OnHostDisconnected(PipeClosed) avant de débloquer RunAsync. L'app
+                // peut faire un cleanup d'urgence dans le hook.
+                HandleHostDisconnected(HostDisconnectReason.PipeClosed);
                 _shutdownTcs.TrySetResult(true);
             };
 
@@ -83,6 +112,18 @@ public static class WpsModuleService
 
             await _connection.WaitForWelcomeAsync();
             WpsDebugSender.Log($"WELCOME received from host — service ready to register handlers", LogLevel.Info, _logTag);
+
+            // (v1.3) Démarre le watchdog "silence PING > 30s". Utilise System.Threading.Timer
+            // (pas DispatcherTimer comme côté Module classique) car le ModuleService peut être
+            // une console pure sans Application WPF — le timer ThreadPool fonctionne dans tous
+            // les cas.
+            StartHeartbeatWatchdog();
+
+            // (v1.3) Hook Windows SessionEnding : déclenche un CAN_CLOSE local urgent au
+            // shutdown OS. Fonctionne au niveau process (message-only window WPF — créée
+            // automatiquement dès qu'on touche à Application/Dispatcher), aussi efficace pour
+            // une console pure car SystemEvents installe son propre pump message si nécessaire.
+            SystemEvents.SessionEnding += OnSessionEnding;
         }
         catch (Exception ex)
         {
@@ -90,6 +131,13 @@ public static class WpsModuleService
             throw;
         }
     }
+
+    /// <summary>(v1.3) Optionnel : enregistre un implémenteur de <see cref="IWpsModule"/> pour
+    /// recevoir les hooks lifecycle (<c>OnCanCloseRequestedAsync</c>, <c>OnCanCloseAborted</c>,
+    /// <c>OnShutdownRequested</c>, <c>OnHostDisconnected</c>). À appeler AVANT
+    /// <see cref="BootstrapAsync"/> ou très tôt — sinon le négociateur n'aura pas la référence
+    /// et le SDK utilisera le comportement par défaut (Ok à tous les CAN_CLOSE).</summary>
+    public static void Register(IWpsModule module) => _module = module;
 
     /// <summary>
     /// Enregistre un handler typé pour une méthode invocable. Le SDK gère sérialisation /
@@ -142,7 +190,7 @@ public static class WpsModuleService
                 }
             };
             if (dispatcher is not null && !dispatcher.CheckAccess())
-                dispatcher.BeginInvoke(show);
+                _ = dispatcher.BeginInvoke(show);
             else
                 show();
         });
@@ -179,8 +227,110 @@ public static class WpsModuleService
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; _shutdownTcs.TrySetResult(true); };
         }
         await _shutdownTcs.Task;
+        try { SystemEvents.SessionEnding -= OnSessionEnding; } catch { /* tolérant */ }
+        _heartbeatWatchdog?.Dispose();
+        _heartbeatWatchdog = null;
         _connection?.Dispose();
         WpsDebugSender.Log($"RunAsync exit — service shutting down", LogLevel.Info, _logTag);
+    }
+
+    // ====== v1.3 : APIs publiques pour le shutdown négocié ======
+
+    /// <summary>(v1.3) Envoie une mise à jour BUSY_PROGRESS au host pendant un Busy long. À
+    /// appeler à intervalle régulier (~3s) après un retour Busy de
+    /// <see cref="IWpsModule.OnCanCloseRequestedAsync"/>. Safe à appeler hors période Busy
+    /// (silencieusement ignoré côté SDK).</summary>
+    public static Task ReportBusyProgress(BusyProgress progress)
+    {
+        if (!IsEmbedded || _connection is null) return Task.CompletedTask;
+        return _connection.SendBusyProgressAsync(progress.Percent, progress.Message);
+    }
+
+    /// <summary>(v1.3) Notifie le host que le service se ferme à son initiative (bouton Quitter
+    /// dans la settings window, logique métier qui termine, etc.). Permet au host de griser le
+    /// slot proprement (état "Closed" plutôt que "Failed").</summary>
+    public static Task NotifySelfClosing(string reason)
+    {
+        if (!IsEmbedded || _connection is null) return Task.CompletedTask;
+        return _connection.SendSelfClosingAsync(reason);
+    }
+
+    /// <summary>(v1.3) Résolution asynchrone d'un <see cref="IWpsModule.OnCanCloseRequestedAsync"/>
+    /// retourné en Busy ou NeedUser. À appeler quand l'app a fini son Busy long ou quand
+    /// l'utilisateur a tranché un dialog NeedUser.</summary>
+    public static Task ResolveCanClose(CanCloseDecision decision)
+    {
+        if (!IsEmbedded || _negotiator is null) return Task.CompletedTask;
+        return _negotiator.ResolveAsync(decision);
+    }
+
+    // ====== v1.3 : implémentation interne ======
+
+    /// <summary>(v1.3) Démarre le watchdog "silence PING > 30s" sur le ThreadPool via
+    /// System.Threading.Timer. Pas de dépendance Application WPF (un ModuleService peut être
+    /// console pure). À l'expiration du timeout, déclenche
+    /// <see cref="HandleHostDisconnected"/>(HeartbeatSilent).</summary>
+    private static void StartHeartbeatWatchdog()
+    {
+        var period = TimeSpan.FromSeconds(HEARTBEAT_WATCHDOG_PERIOD_SECONDS);
+        _heartbeatWatchdog = new System.Threading.Timer(_ =>
+        {
+            if (_connection is null || _hostDisconnected) return;
+            var silenceSecs = (DateTime.UtcNow - _connection.LastPingReceivedUtc).TotalSeconds;
+            if (silenceSecs > HEARTBEAT_SILENCE_TIMEOUT_SECONDS)
+            {
+                WpsDebugSender.Log(
+                    $"Heartbeat watchdog: aucun PING reçu depuis {silenceSecs:F0}s (> {HEARTBEAT_SILENCE_TIMEOUT_SECONDS}s) — host figé/mort",
+                    LogLevel.Warning, _logTag);
+                HandleHostDisconnected(HostDisconnectReason.HeartbeatSilent);
+            }
+        }, null, period, period);
+    }
+
+    /// <summary>(v1.3) Centralise la gestion de "host disparu" pour les 2 sources (pipe coupé,
+    /// silence PING). Idempotent. Appelle le hook applicatif puis débloque le RunAsync — l'app
+    /// sortira de sa boucle proprement (vs Application.Current.Shutdown côté Module classique
+    /// qui force un shutdown WPF immédiat).</summary>
+    private static void HandleHostDisconnected(HostDisconnectReason reason)
+    {
+        if (_hostDisconnected) return;  // idempotent
+        _hostDisconnected = true;
+
+        WpsDebugSender.Log($"Host disconnected (reason={reason}) — exiting RunAsync after hook",
+            LogLevel.Warning, _logTag);
+
+        // Marshalling conditionnel : si Application.Current existe (settings window WPF),
+        // appel sur Dispatcher ; sinon direct.
+        var dispatcher = System.Windows.Application.Current?.Dispatcher;
+        Action invoke = () =>
+        {
+            try { _module?.OnHostDisconnected(reason); }
+            catch (Exception ex)
+            {
+                WpsDebugSender.Log(
+                    $"OnHostDisconnected handler threw {ex.GetType().Name}: {ex.Message}",
+                    LogLevel.Warning, _logTag);
+            }
+        };
+        if (dispatcher is not null && !dispatcher.CheckAccess())
+            _ = dispatcher.BeginInvoke(invoke);
+        else
+            invoke();
+
+        // Débloque RunAsync (idempotent grâce au TCS)
+        _shutdownTcs.TrySetResult(true);
+    }
+
+    /// <summary>(v1.3) Handler du hook <c>SystemEvents.SessionEnding</c> côté ModuleService.
+    /// Identique au Module classique : fire-and-forget un CAN_CLOSE local urgent au négociateur.</summary>
+    private static void OnSessionEnding(object sender, SessionEndingEventArgs e)
+    {
+        if (_negotiator is null) return;
+        WpsDebugSender.Log(
+            $"SystemEvents.SessionEnding (reason={e.Reason}) → CAN_CLOSE local urgent",
+            LogLevel.Info, _logTag);
+        var ctx = new CanCloseContext { IsUrgent = true };
+        _ = _negotiator.OnCanCloseReceivedAsync(ctx);
     }
 
     private static string ParseSession(string[] args)
