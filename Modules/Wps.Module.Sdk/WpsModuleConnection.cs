@@ -8,11 +8,19 @@ namespace Wps.Module;
 /// Connexion IPC côté module : utilise <see cref="WpsPipeDuplex"/> pour le transport bas-niveau
 /// (pipes nommés conformes à <see cref="WpsModuleContract"/>) et y ajoute la logique métier
 /// du contrat wipiSoft : handshake HELLO/WELCOME, dispatch CMD vers <see cref="IWpsModule"/>
-/// (CLOSE / RESIZE), reply heartbeat PING → PONG.
+/// (CLOSE / RESIZE / CAN_CLOSE / CAN_CLOSE_ABORTED), reply heartbeat PING → PONG, envois des
+/// notifications Module → Host (READY, CAN_CLOSE_OK/BUSY/NEED_USER/REJECTED, BUSY_PROGRESS,
+/// CLOSING_DONE, SELF_CLOSING).
 ///
-/// Le heartbeat reply utilise <see cref="Dispatcher.InvokeAsync"/> avec un no-op : si l'UI
-/// thread est figé, le dispatch ne complète jamais → pas de PONG envoyé → host détecte le
-/// hang. C'est la mécanique cruciale pour distinguer "module crashé" de "module figé".
+/// <para>Le heartbeat reply utilise <see cref="Dispatcher.InvokeAsync"/> avec un no-op : si
+/// l'UI thread est figé, le dispatch ne complète jamais → pas de PONG envoyé → host détecte
+/// le hang. C'est la mécanique cruciale pour distinguer "module crashé" de "module figé".</para>
+///
+/// <para><b>v1.3 :</b> la logique de négociation d'arrêt (state machine, clamp urgent, appel
+/// au hook applicatif sur UI thread) est déléguée à <see cref="WpsModuleShutdownNegotiator"/>
+/// pour garder cette classe focalisée sur le transport et le routing. Le tracking
+/// <see cref="LastPingReceivedUtc"/> permet à <see cref="WpsModule"/> d'implémenter le
+/// watchdog "host figé" (pas de PING reçu &gt; 30s).</para>
 /// </summary>
 internal sealed class WpsModuleConnection : IDisposable
 {
@@ -21,6 +29,12 @@ internal sealed class WpsModuleConnection : IDisposable
     private readonly IWpsModule? _module;
     private readonly WpsPipeDuplex _duplex;
 
+    /// <summary>Négociateur shutdown v1.3, créé après le constructeur (cf. <see cref="AttachNegotiator"/>).
+    /// La référence circulaire négociateur ↔ connexion est résolue avec ce setter explicite :
+    /// la connexion existe en premier (handshake HELLO/WELCOME), le négociateur est attaché
+    /// après pour traiter les CAN_CLOSE qui viendront éventuellement.</summary>
+    private WpsModuleShutdownNegotiator? _negotiator;
+
     // ⚠️ Initialisé dans le constructeur, AVANT que le ReadLoop ou SendHelloAsync ne tournent.
     // Si on l'initialisait dans WaitForWelcomeAsync (appelé après SendHello), il y aurait une
     // race condition : le host répond WELCOME en <20ms, le ReadLoop le reçoit, et
@@ -28,6 +42,16 @@ internal sealed class WpsModuleConnection : IDisposable
     // Bug observé sur le 2e module lancé séquentiellement (timing très serré entre slots).
     private readonly TaskCompletionSource<string> _welcomeTcs =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>(v1.3) Timestamp UTC du dernier PING reçu du host. Permet à <see cref="WpsModule"/>
+    /// d'implémenter le watchdog "host figé" : si silence &gt; 30s, on considère le host mort
+    /// et on déclenche <see cref="IWpsModule.OnHostDisconnected"/>(HeartbeatSilent).</summary>
+    public DateTime LastPingReceivedUtc { get; private set; } = DateTime.UtcNow;
+
+    /// <summary>Expose le pipe duplex pour permettre à <see cref="WpsModule"/> de s'abonner à
+    /// l'event <see cref="WpsPipeDuplex.Closed"/> et déclencher
+    /// <see cref="IWpsModule.OnHostDisconnected"/>(PipeClosed) à la coupure.</summary>
+    public WpsPipeDuplex Duplex => _duplex;
 
     private const string LogTag = "Wps.Module.Sdk";
 
@@ -43,6 +67,11 @@ internal sealed class WpsModuleConnection : IDisposable
         _duplex = new WpsPipeDuplex(inboundPipeName: cmdPipe, outboundPipeName: notifPipe, LogTag);
         _duplex.LineReceived += Dispatch;
     }
+
+    /// <summary>Attache le négociateur de shutdown (création différée pour résoudre la
+    /// dépendance circulaire négociateur → connexion). Appelé par <see cref="WpsModule.Bootstrap"/>
+    /// après création de la connexion.</summary>
+    public void AttachNegotiator(WpsModuleShutdownNegotiator negotiator) => _negotiator = negotiator;
 
     /// <summary>Ouvre les pipes via <see cref="WpsPipeDuplex"/>. Démarre la lecture.</summary>
     public Task StartAsync(CancellationToken ct = default) => _duplex.StartAsync(ct);
@@ -69,6 +98,46 @@ internal sealed class WpsModuleConnection : IDisposable
         _duplex.SendAsync(FormattableString.Invariant(
             $"{WpsModuleContract.NotifReady}{WpsModuleContract.Separator}{hwnd.ToInt64()}"));
 
+    // ====== v1.3 : envois Module → Host ======
+
+    /// <summary>(v1.3) Envoie CAN_CLOSE_OK : le module est libre de fermer.</summary>
+    public Task SendCanCloseOkAsync() =>
+        _duplex.SendAsync(WpsModuleContract.NotifCanCloseOk);
+
+    /// <summary>(v1.3) Envoie CAN_CLOSE_BUSY|estimatedMs|reason. Le host attend ensuite des
+    /// BUSY_PROGRESS périodiques + un CAN_CLOSE_OK final.</summary>
+    public Task SendCanCloseBusyAsync(int estimatedMs, string reason) =>
+        _duplex.SendAsync(FormattableString.Invariant(
+            $"{WpsModuleContract.NotifCanCloseBusy}{WpsModuleContract.Separator}{estimatedMs}{WpsModuleContract.Separator}{reason ?? ""}"));
+
+    /// <summary>(v1.3) Envoie CAN_CLOSE_NEED_USER|reason. Le host bascule l'onglet sur le module
+    /// pour permettre l'interaction utilisateur.</summary>
+    public Task SendCanCloseNeedUserAsync(string reason) =>
+        _duplex.SendAsync($"{WpsModuleContract.NotifCanCloseNeedUser}{WpsModuleContract.Separator}{reason ?? ""}");
+
+    /// <summary>(v1.3) Envoie CAN_CLOSE_REJECTED|reason. Le host annule sa fermeture en cascade.</summary>
+    public Task SendCanCloseRejectedAsync(string reason) =>
+        _duplex.SendAsync($"{WpsModuleContract.NotifCanCloseRejected}{WpsModuleContract.Separator}{reason ?? ""}");
+
+    /// <summary>(v1.3) Envoie BUSY_PROGRESS|percent|message. À envoyer toutes les ~3s pendant
+    /// un Busy long pour rester en deça du heartbeat timeout 8s côté host.</summary>
+    public Task SendBusyProgressAsync(int percent, string message) =>
+        _duplex.SendAsync(FormattableString.Invariant(
+            $"{WpsModuleContract.NotifBusyProgress}{WpsModuleContract.Separator}{percent}{WpsModuleContract.Separator}{message ?? ""}"));
+
+    /// <summary>(v1.3) Envoie CLOSING_DONE — phase finale, le process va exit. Le host
+    /// considère le module proprement fermé (vs Kill fallback).</summary>
+    public Task SendClosingDoneAsync() =>
+        _duplex.SendAsync(WpsModuleContract.NotifClosingDone);
+
+    /// <summary>(v1.3) Envoie SELF_CLOSING|reason — le module se ferme à son initiative
+    /// (bouton Quitter dans son UI, logique métier). Permet au host de griser le slot
+    /// proprement (état "Closed" plutôt que "Failed" du crash non sollicité).</summary>
+    public Task SendSelfClosingAsync(string reason) =>
+        _duplex.SendAsync($"{WpsModuleContract.NotifSelfClosing}{WpsModuleContract.Separator}{reason ?? ""}");
+
+    // ====== Dispatch des messages reçus du host ======
+
     private void Dispatch(string line)
     {
         var parts = line.Split(WpsModuleContract.Separator);
@@ -79,12 +148,18 @@ internal sealed class WpsModuleConnection : IDisposable
                 break;
 
             case WpsModuleContract.CmdClose:
-                // Hook applicatif ; sinon on tombe en standalone-shutdown via Application.Current
-                _uiDispatcher.BeginInvoke(new Action(() =>
-                {
-                    if (_module is not null) _module.OnShutdownRequested();
-                    else System.Windows.Application.Current?.Shutdown();
-                }));
+                // v1.3 : si négociateur attaché, route via la state machine (qui appellera
+                // OnShutdownRequested + enverra CLOSING_DONE proprement). Si pas de négociateur
+                // (cas dégénéré : Bootstrap a échoué avant AttachNegotiator), fallback legacy
+                // direct.
+                if (_negotiator is not null)
+                    _ = _negotiator.OnCloseReceivedAsync();
+                else
+                    _uiDispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (_module is not null) _module.OnShutdownRequested();
+                        else System.Windows.Application.Current?.Shutdown();
+                    }));
                 break;
 
             case WpsModuleContract.CmdResize when parts.Length == 4:
@@ -97,7 +172,27 @@ internal sealed class WpsModuleConnection : IDisposable
                 break;
 
             case WpsModuleContract.CmdPing:
+                LastPingReceivedUtc = DateTime.UtcNow;  // (v1.3) reset watchdog "host figé"
                 _ = HandlePingAsync();
+                break;
+
+            // ====== v1.3 : nouveaux messages ======
+
+            case WpsModuleContract.CmdCanClose:
+                {
+                    // Format : CAN_CLOSE|isUrgent (0 ou 1)
+                    var isUrgent = parts.Length >= 2 && parts[1] == "1";
+                    var ctx = new CanCloseContext { IsUrgent = isUrgent };
+                    if (_negotiator is not null)
+                        _ = _negotiator.OnCanCloseReceivedAsync(ctx);
+                    else
+                        // Pas de négociateur : on répond Ok par défaut pour ne pas bloquer.
+                        _ = SendCanCloseOkAsync();
+                }
+                break;
+
+            case WpsModuleContract.CmdCanCloseAborted:
+                _negotiator?.OnCanCloseAborted();
                 break;
         }
     }
