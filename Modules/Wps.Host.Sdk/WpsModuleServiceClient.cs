@@ -22,7 +22,7 @@ namespace Wps.Module.Hosting;
 /// await client.ShutdownAsync();   // ou client.Dispose() en contexte sync
 /// </code>
 /// </summary>
-public sealed class WpsModuleServiceClient : IDisposable
+public sealed class WpsModuleServiceClient : IDisposable, IWpsShutdownTarget
 {
     private WpsHostConnection? _connection;
     private Process? _process;
@@ -68,6 +68,32 @@ public sealed class WpsModuleServiceClient : IDisposable
 
     /// <summary>Timeout par défaut pour <see cref="InvokeAsync"/> si non précisé.</summary>
     public TimeSpan DefaultInvokeTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    // ====== v1.3 : surface IWpsShutdownTarget + events de progression ======
+
+    /// <inheritdoc/>
+    string IWpsShutdownTarget.Name => string.IsNullOrEmpty(ServiceName) ? "(unknown)" : ServiceName;
+
+    /// <inheritdoc/>
+    public bool SupportsNegotiatedShutdown => ParseContractAtLeast(ServiceContractVersion, 1, 3);
+
+    /// <summary>(v1.3) Émis pendant un Busy long quand le service envoie un BUSY_PROGRESS.</summary>
+    public event Action<HostBusyProgress>? BusyProgressChanged;
+
+    /// <summary>(v1.3) Émis si le service signale NEED_USER en cours de séquence (rare côté
+    /// ModuleService — plutôt typique d'une settings window ouverte ad hoc).</summary>
+    public event Action<string>? NeedUserSignaled;
+
+    /// <summary>(v1.3) Émis quand le service se ferme à son initiative (SELF_CLOSING reçu).</summary>
+    public event Action<string>? SelfClosing;
+
+    /// <summary>(v1.3) Alias plus sémantique de <see cref="ProcessExited"/> pour les callers
+    /// de <see cref="IWpsShutdownTarget"/>.</summary>
+    event Action? IWpsShutdownTarget.Disconnected
+    {
+        add { ProcessExited += value; }
+        remove { ProcessExited -= value; }
+    }
 
     private const string LogTag = "Wps.Host.Sdk";
 
@@ -115,6 +141,14 @@ public sealed class WpsModuleServiceClient : IDisposable
         };
         _connection.HungStateChanged += hung => HungStateChanged?.Invoke(hung);
         _connection.InvokeResultReceived += OnInvokeResultReceived;
+
+        // (v1.3) Republie les events de la connexion vers les events publics du client.
+        _connection.BusyProgressReceived += (percent, msg) =>
+            BusyProgressChanged?.Invoke(new HostBusyProgress(percent, msg));
+        _connection.CanCloseNeedUser += reason =>
+            NeedUserSignaled?.Invoke(reason);
+        _connection.SelfClosing += reason =>
+            SelfClosing?.Invoke(reason);
 
         var startTask = _connection.StartAsync(ct);
 
@@ -244,8 +278,224 @@ public sealed class WpsModuleServiceClient : IDisposable
     /// <summary>Demande au service d'afficher sa fenêtre de paramétrage (s'il en a une).</summary>
     public Task ShowSettingsAsync() => _connection?.SendShowSettingsAsync() ?? Task.CompletedTask;
 
-    /// <summary>Demande la fermeture propre via CLOSE.</summary>
+    /// <summary>Demande la fermeture propre via CLOSE direct (API bas-niveau, sans wait ni Kill).
+    /// Préférer <see cref="ShutdownAsync(ShutdownOptions, CancellationToken)"/> qui orchestre tout.</summary>
     public Task RequestCloseAsync() => _connection?.SendCloseAsync() ?? Task.CompletedTask;
+
+    // ====== v1.3 : API canonique étendue (cf. WpsModuleSlot pour la doc détaillée) ======
+
+    /// <inheritdoc cref="WpsModuleSlot.RequestCanCloseAsync"/>
+    public async Task<CanCloseResponse> RequestCanCloseAsync(ShutdownOptions opts, CancellationToken ct = default)
+    {
+        if (_disposed || _connection is null) return CanCloseResponse.Ok;
+        if (!SupportsNegotiatedShutdown)
+            throw new InvalidOperationException(
+                $"Service '{ServiceName}' v{ServiceContractVersion} ne supporte pas le shutdown négocié — " +
+                $"utiliser ShutdownAsync(opts) qui route automatiquement vers le legacy v1.2.");
+
+        var tcs = new TaskCompletionSource<CanCloseResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Action onOk = () => tcs.TrySetResult(CanCloseResponse.Ok);
+        Action<int, string> onBusy = (estMs, reason) => tcs.TrySetResult(CanCloseResponse.Busy(estMs, reason));
+        Action<string> onNeedUser = reason => tcs.TrySetResult(CanCloseResponse.NeedUser(reason));
+        Action<string> onRejected = reason => tcs.TrySetResult(CanCloseResponse.Rejected(reason));
+
+        _connection.CanCloseOk += onOk;
+        _connection.CanCloseBusy += onBusy;
+        _connection.CanCloseNeedUser += onNeedUser;
+        _connection.CanCloseRejected += onRejected;
+
+        try
+        {
+            await _connection.SendCanCloseAsync(opts.IsUrgent).ConfigureAwait(false);
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(opts.CanCloseTimeoutMs);
+            using var _ = timeoutCts.Token.Register(() => tcs.TrySetResult(CanCloseResponse.Timeout));
+
+            return await tcs.Task.ConfigureAwait(false);
+        }
+        finally
+        {
+            _connection.CanCloseOk -= onOk;
+            _connection.CanCloseBusy -= onBusy;
+            _connection.CanCloseNeedUser -= onNeedUser;
+            _connection.CanCloseRejected -= onRejected;
+        }
+    }
+
+    /// <inheritdoc cref="WpsModuleSlot.SendCanCloseAbortedAsync"/>
+    public Task SendCanCloseAbortedAsync()
+    {
+        if (_disposed || _connection is null) return Task.CompletedTask;
+        return _connection.SendCanCloseAbortedAsync();
+    }
+
+    /// <inheritdoc cref="WpsModuleSlot.CompleteShutdownAsync"/>
+    public async Task<ShutdownResult> CompleteShutdownAsync(ShutdownOptions opts, CancellationToken ct = default)
+    {
+        if (_disposed) return ShutdownResult.NoOp;
+        if (_process is null || _process.HasExited)
+        {
+            FailAllPendingInvokes("service already exited");
+            DisposeUnmanaged();
+            return ShutdownResult.AlreadyExited;
+        }
+
+        var sidShort = string.IsNullOrEmpty(_sessionId) ? "?" : _sessionId[..Math.Min(8, _sessionId.Length)];
+
+        var closingDoneTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Action onClosingDone = () => closingDoneTcs.TrySetResult(true);
+        if (_connection is not null) _connection.ClosingDone += onClosingDone;
+
+        try
+        {
+            WpsDebugSender.Log($"CompleteShutdownAsync [{sidShort}]: sending CLOSE (grace={opts.CleanupGracePeriodMs}ms)",
+                LogLevel.Info, LogTag);
+            await RequestCloseAsync().ConfigureAwait(false);
+
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(opts.CleanupGracePeriodMs);
+
+            var processExitTask = _process.WaitForExitAsync(cts.Token);
+            var first = await Task.WhenAny(closingDoneTcs.Task, processExitTask).ConfigureAwait(false);
+
+            if (first == closingDoneTcs.Task && !_process.HasExited)
+            {
+                using var shortCts = new CancellationTokenSource(2000);
+                try { await _process.WaitForExitAsync(shortCts.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) { }
+            }
+
+            if (_process.HasExited)
+            {
+                WpsDebugSender.Log($"CompleteShutdownAsync [{sidShort}]: process exited gracefully",
+                    LogLevel.Success, LogTag);
+                _disposed = true;
+                FailAllPendingInvokes("service shut down");
+                DisposeUnmanaged();
+                return ShutdownResult.Completed;
+            }
+
+            if (opts.KillFallback)
+            {
+                WpsDebugSender.Log($"CompleteShutdownAsync [{sidShort}]: grace expired ({opts.CleanupGracePeriodMs}ms) → Kill(true)",
+                    LogLevel.Warning, LogTag);
+                try { _process.Kill(true); }
+                catch (Exception ex)
+                {
+                    WpsDebugSender.Log($"CompleteShutdownAsync [{sidShort}]: Kill threw {ex.GetType().Name}: {ex.Message}",
+                        LogLevel.Trace, LogTag);
+                }
+                _disposed = true;
+                FailAllPendingInvokes("service killed (timeout)");
+                DisposeUnmanaged();
+                return ShutdownResult.Killed;
+            }
+
+            _disposed = true;
+            FailAllPendingInvokes("service shut down (no kill fallback)");
+            DisposeUnmanaged();
+            return ShutdownResult.Completed;
+        }
+        finally
+        {
+            if (_connection is not null) _connection.ClosingDone -= onClosingDone;
+        }
+    }
+
+    /// <inheritdoc cref="WpsModuleSlot.ShutdownAsync(ShutdownOptions, CancellationToken)"/>
+    public async Task<ShutdownResult> ShutdownAsync(ShutdownOptions opts, CancellationToken ct = default)
+    {
+        if (_disposed) return ShutdownResult.NoOp;
+        if (_process is null || _process.HasExited)
+        {
+            FailAllPendingInvokes("service already exited");
+            DisposeUnmanaged();
+            _disposed = true;
+            return ShutdownResult.AlreadyExited;
+        }
+
+        if (!SupportsNegotiatedShutdown)
+        {
+            // Legacy v1.2
+            await ShutdownAsync(opts.CleanupGracePeriodMs).ConfigureAwait(false);
+            return _process is null || _process.HasExited ? ShutdownResult.Completed : ShutdownResult.Killed;
+        }
+
+        var canCloseResult = await RequestCanCloseAsync(opts, ct).ConfigureAwait(false);
+        switch (canCloseResult)
+        {
+            case CanCloseResponse.RejectedR rejected:
+                WpsDebugSender.Log($"ShutdownAsync: service REJECTED ({rejected.Reason}) — annulation",
+                    LogLevel.Info, LogTag);
+                return ShutdownResult.Aborted;
+
+            case CanCloseResponse.NeedUserR needUser:
+                WpsDebugSender.Log($"ShutdownAsync: NeedUser ({needUser.Reason}) reçu hors orchestrateur → Kill",
+                    LogLevel.Warning, LogTag);
+                if (opts.KillFallback) try { _process.Kill(true); } catch { }
+                _disposed = true;
+                FailAllPendingInvokes("service killed (need_user out of orchestrator)");
+                DisposeUnmanaged();
+                return ShutdownResult.Killed;
+
+            case CanCloseResponse.BusyR busy:
+                await WaitForBusyToResolveAsync(busy, opts, ct).ConfigureAwait(false);
+                return await CompleteShutdownAsync(opts, ct).ConfigureAwait(false);
+
+            case CanCloseResponse.OkR or CanCloseResponse.TimeoutR:
+            default:
+                return await CompleteShutdownAsync(opts, ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task WaitForBusyToResolveAsync(CanCloseResponse.BusyR initial, ShutdownOptions opts, CancellationToken ct)
+    {
+        if (_connection is null) return;
+        var lastSignalUtc = DateTime.UtcNow;
+        var resolvedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Action onOk = () => resolvedTcs.TrySetResult(true);
+        Action<int, string> onProgress = (_, _) => lastSignalUtc = DateTime.UtcNow;
+        _connection.CanCloseOk += onOk;
+        _connection.BusyProgressReceived += onProgress;
+
+        try
+        {
+            while (!resolvedTcs.Task.IsCompleted)
+            {
+                ct.ThrowIfCancellationRequested();
+                var silence = (DateTime.UtcNow - lastSignalUtc).TotalMilliseconds;
+                if (silence > opts.BusyHeartbeatTimeoutMs)
+                {
+                    WpsDebugSender.Log(
+                        $"ShutdownAsync: silence Busy > {opts.BusyHeartbeatTimeoutMs}ms — Kill",
+                        LogLevel.Warning, LogTag);
+                    return;
+                }
+                var poll = Task.Delay(500, ct);
+                await Task.WhenAny(resolvedTcs.Task, poll).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            _connection.CanCloseOk -= onOk;
+            _connection.BusyProgressReceived -= onProgress;
+        }
+    }
+
+    /// <summary>Parse une version "major.minor" et retourne true si elle est >= la version
+    /// minimale donnée. Tolérant : si parse échoue, renvoie false (= legacy fallback).</summary>
+    private static bool ParseContractAtLeast(string version, int minMajor, int minMinor)
+    {
+        if (string.IsNullOrEmpty(version)) return false;
+        var parts = version.Split('.');
+        if (parts.Length < 2) return false;
+        if (!int.TryParse(parts[0], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var major)) return false;
+        if (!int.TryParse(parts[1], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var minor)) return false;
+        return major > minMajor || (major == minMajor && minor >= minMinor);
+    }
 
     /// <summary>
     /// Terminaison canonique du client : envoie CLOSE via IPC, attend l'exit du process

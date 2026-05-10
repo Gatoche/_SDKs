@@ -40,6 +40,32 @@ internal sealed class WpsHostConnection : IDisposable
     /// d'erreur). Consommé par <see cref="WpsModuleServiceClient.InvokeAsync"/>.</summary>
     public event Action<string, bool, string>? InvokeResultReceived;
 
+    // ====== v1.3 : événements du shutdown négocié reçus du module ======
+
+    /// <summary>(v1.3) Émis à réception de <c>CAN_CLOSE_OK</c> : le module est libre, peut fermer.</summary>
+    public event Action? CanCloseOk;
+
+    /// <summary>(v1.3) Émis à réception de <c>CAN_CLOSE_BUSY|estimatedMs|reason</c>.</summary>
+    public event Action<int, string>? CanCloseBusy;
+
+    /// <summary>(v1.3) Émis à réception de <c>CAN_CLOSE_NEED_USER|reason</c>.</summary>
+    public event Action<string>? CanCloseNeedUser;
+
+    /// <summary>(v1.3) Émis à réception de <c>CAN_CLOSE_REJECTED|reason</c>.</summary>
+    public event Action<string>? CanCloseRejected;
+
+    /// <summary>(v1.3) Émis à réception de <c>BUSY_PROGRESS|percent|message</c>.</summary>
+    public event Action<int, string>? BusyProgressReceived;
+
+    /// <summary>(v1.3) Émis à réception de <c>CLOSING_DONE</c> : cleanup applicatif terminé,
+    /// le process va exit immédiatement.</summary>
+    public event Action? ClosingDone;
+
+    /// <summary>(v1.3) Émis à réception de <c>SELF_CLOSING|reason</c> : le module se ferme à
+    /// son initiative (bouton Quitter, etc.). Permet au host de griser le slot proprement
+    /// (état "Closed" plutôt que "Failed").</summary>
+    public event Action<string>? SelfClosing;
+
     private const string LogTag = "Wps.Host.Sdk";
 
     public WpsHostConnection(string sessionId)
@@ -61,6 +87,18 @@ internal sealed class WpsHostConnection : IDisposable
         _duplex.SendAsync($"{WpsModuleContract.CmdWelcome}{WpsModuleContract.Separator}{hostContractVersion}");
 
     public Task SendCloseAsync() => _duplex.SendAsync(WpsModuleContract.CmdClose);
+
+    /// <summary>(v1.3) Envoie <c>CAN_CLOSE|isUrgent</c> au module pour engager la phase 1 du
+    /// shutdown négocié. Le module répondra avec <c>CAN_CLOSE_OK</c> / <c>BUSY</c> /
+    /// <c>NEED_USER</c> / <c>REJECTED</c> via les events correspondants.</summary>
+    public Task SendCanCloseAsync(bool isUrgent) =>
+        _duplex.SendAsync($"{WpsModuleContract.CmdCanClose}{WpsModuleContract.Separator}{(isUrgent ? "1" : "0")}");
+
+    /// <summary>(v1.3) Envoie <c>CAN_CLOSE_ABORTED</c> au module pour libérer son verrou Locked
+    /// (cascade annulée par un autre module qui a renvoyé Rejected). Le module reprend son
+    /// fonctionnement normal et l'app reçoit <c>OnCanCloseAborted</c>.</summary>
+    public Task SendCanCloseAbortedAsync() =>
+        _duplex.SendAsync(WpsModuleContract.CmdCanCloseAborted);
 
     /// <summary>(v1.2, ModuleService) Envoie INVOKE|requestId|method|jsonParams au peer.
     /// La réponse arrivera asynchrone via <see cref="InvokeResultReceived"/> avec le même
@@ -123,6 +161,46 @@ internal sealed class WpsHostConnection : IDisposable
             return;
         }
 
+        // (v1.3) Pour les messages avec un payload "reason" qui peut contenir des '|', on split
+        // à un nombre fixe de parts (la dernière contient tout le reste). Patterns :
+        //   CAN_CLOSE_BUSY|estimatedMs|reason          → 3 parts
+        //   CAN_CLOSE_NEED_USER|reason                 → 2 parts
+        //   CAN_CLOSE_REJECTED|reason                  → 2 parts
+        //   BUSY_PROGRESS|percent|message              → 3 parts
+        //   SELF_CLOSING|reason                        → 2 parts
+        if (line.StartsWith(WpsModuleContract.NotifCanCloseBusy + WpsModuleContract.Separator, StringComparison.Ordinal))
+        {
+            var p = line.Split(WpsModuleContract.Separator, 3);
+            if (p.Length >= 3 && int.TryParse(p[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var estMs))
+                CanCloseBusy?.Invoke(estMs, p[2]);
+            return;
+        }
+        if (line.StartsWith(WpsModuleContract.NotifCanCloseNeedUser + WpsModuleContract.Separator, StringComparison.Ordinal))
+        {
+            var p = line.Split(WpsModuleContract.Separator, 2);
+            if (p.Length >= 2) CanCloseNeedUser?.Invoke(p[1]);
+            return;
+        }
+        if (line.StartsWith(WpsModuleContract.NotifCanCloseRejected + WpsModuleContract.Separator, StringComparison.Ordinal))
+        {
+            var p = line.Split(WpsModuleContract.Separator, 2);
+            if (p.Length >= 2) CanCloseRejected?.Invoke(p[1]);
+            return;
+        }
+        if (line.StartsWith(WpsModuleContract.NotifBusyProgress + WpsModuleContract.Separator, StringComparison.Ordinal))
+        {
+            var p = line.Split(WpsModuleContract.Separator, 3);
+            if (p.Length >= 3 && int.TryParse(p[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var percent))
+                BusyProgressReceived?.Invoke(percent, p[2]);
+            return;
+        }
+        if (line.StartsWith(WpsModuleContract.NotifSelfClosing + WpsModuleContract.Separator, StringComparison.Ordinal))
+        {
+            var p = line.Split(WpsModuleContract.Separator, 2);
+            if (p.Length >= 2) SelfClosing?.Invoke(p[1]);
+            return;
+        }
+
         var parts = line.Split(WpsModuleContract.Separator);
         switch (parts[0])
         {
@@ -154,6 +232,15 @@ internal sealed class WpsHostConnection : IDisposable
                     WpsDebugSender.Log($"PONG reçu, module récupéré (was hung)", LogLevel.Info, LogTag);
                     HungStateChanged?.Invoke(false);
                 }
+                break;
+
+            // (v1.3) Messages sans payload variable
+            case WpsModuleContract.NotifCanCloseOk:
+                CanCloseOk?.Invoke();
+                break;
+
+            case WpsModuleContract.NotifClosingDone:
+                ClosingDone?.Invoke();
                 break;
         }
     }
