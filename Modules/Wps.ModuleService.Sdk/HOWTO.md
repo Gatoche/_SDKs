@@ -218,6 +218,79 @@ Pas de code à ajouter côté service : le host gère le flag Daemon via
 - L'utilisateur peut désactiver via le toggle dans la pageslot du service
 - Si Daemon=false : le service n'est lancé que sur clic explicite "Redémarrer" dans la pageslot
 
+### 7. (v1.3, recommandé) Shutdown négocié via `IWpsModule`
+
+Depuis le contrat **v1.3**, le SDK ModuleService supporte la négociation d'arrêt côté
+service comme côté Module classique. Le service peut :
+
+1. Implémenter `Wps.Module.IWpsModule` sur sa classe `App` (ou une classe dédiée)
+2. Appeler `WpsModuleService.Register(this)` au début de `ConfigureEmbeddedAsync`
+
+Hooks principaux :
+
+- **`OnCanCloseRequestedAsync(ctx)`** : phase 1 du shutdown. Faire le cleanup synchrone
+  rapide (ABM_REMOVE, flush BDD courte, etc.) **avant de répondre Ok**. Pour un cleanup
+  long, retourner `Busy(estimatedMs)` + `ReportBusyProgress` périodique + `ResolveCanClose(Ok)`
+  à la fin.
+- **`OnShutdownRequested()`** : phase finale après notre Ok. Le cleanup applicatif est
+  déjà fait dans le hook précédent ; ici juste `Application.Shutdown()` (ou laisser tomber
+  si pas d'Application WPF — le SDK exit le process).
+- **`OnHostDisconnected(reason)`** : pipe coupé ou silence PING > 30s. Filet pour les cas
+  où le host crashe sans envoyer CAN_CLOSE. Cleanup d'urgence + `Application.Shutdown()`
+  (le SDK ne le fait PAS automatiquement côté ModuleService — c'est différent du Module
+  classique car le ModuleService peut être console pure sans Application WPF ; il faut
+  appeler `Shutdown` explicitement si pertinent).
+
+Exemple concret (extrait simplifié de MiniBoard) :
+
+```csharp
+public partial class App : Application, IWpsModule
+{
+    public ValueTask<CanCloseDecision> OnCanCloseRequestedAsync(CanCloseContext ctx)
+    {
+        // Cleanup synchrone rapide AVANT de répondre Ok au host. Évite que Kill fallback
+        // shoote le cleanup applicatif si jamais grace expire (~7s default).
+        AppBarManager.Unregister();
+        return new ValueTask<CanCloseDecision>(CanCloseDecision.Ok);
+    }
+
+    public void OnShutdownRequested()
+    {
+        // CLOSE reçu après notre Ok → Application.Shutdown.
+        Application.Current?.Shutdown();
+    }
+
+    public void OnHostDisconnected(HostDisconnectReason reason)
+    {
+        // Filet : host crashed/frozen, on n'aura pas eu de CAN_CLOSE négocié.
+        AppBarManager.Unregister();  // idempotent
+        Application.Current?.Shutdown();
+    }
+
+    private async Task ConfigureEmbeddedAsync()
+    {
+        WpsModuleService.Register(this);  // ← branche les hooks ci-dessus
+
+        WpsModuleService.RegisterSettingsWindow(() => _mainWindow!);
+        WpsModuleService.RegisterInvokeHandler<...>("...");
+
+        await WpsModuleService.NotifyReadyAsync();
+        _ = Task.Run(async () =>
+        {
+            await WpsModuleService.RunAsync();
+            Application.Current.Dispatcher.Invoke(() => Application.Current.Shutdown());
+        });
+    }
+}
+```
+
+APIs publiques v1.3 supplémentaires :
+
+- `WpsModuleService.ReportBusyProgress(BusyProgress)` pour les Busy longs
+- `WpsModuleService.NotifySelfClosing(reason)` quand le service se ferme à son initiative
+  (bouton Quitter dans la settings window, etc.) — permet au host de griser proprement
+- `WpsModuleService.ResolveCanClose(decision)` pour résoudre un Busy/NeedUser asynchrone
+
 ## Test
 
 ### Standalone
@@ -253,3 +326,16 @@ pageslot → tu vois le statut (Running/Stopped), boutons Paramètres/Redémarre
   `SweepOrphanModuleServiceProcesses` au prochain démarrage, mais c'est sale).
 - **Manque `NotifyReadyAsync`** → le host considère le service "non prêt", impossible
   d'invoquer ses méthodes (le SDK rejette `InvokeAsync` tant que `IsReady=false` côté client).
+- **(v1.3) Cleanup applicatif dans `OnShutdownRequested` au lieu de `OnCanCloseRequestedAsync`**
+  → si le cleanup est rapide (< 50ms), c'est OK. Mais s'il est long, le faire proactivement
+  dans `OnCanCloseRequestedAsync` AVANT de répondre Ok. C'est ce qui résout le bug
+  historique MiniBoard (ABM_REMOVE arrivait après le Kill côté Explorer).
+- **(v1.3) Oubli de `WpsModuleService.Register(this)` dans `ConfigureEmbeddedAsync`** → les
+  hooks `IWpsModule` ne sont pas appelés, le SDK utilise les DIMs (Ok par défaut). Le service
+  fonctionne mais sans cleanup négocié — on retombe sur le pattern legacy avec event
+  `ShutdownRequested` levé par le SDK et débloquant `RunAsync`.
+- **(v1.3) Retour `Busy(estimatedMs)` sans envoyer de `BUSY_PROGRESS`** → le host considère
+  le service figé après ~8s de silence et passe au Kill. Toujours envoyer
+  `WpsModuleService.ReportBusyProgress(...)` toutes les ~3s pendant un Busy.
+- **(v1.3) Oubli de `WpsModuleService.ResolveCanClose(...)` après un Busy/NeedUser** → host
+  reste en attente jusqu'au timeout, puis Kill. Toujours résoudre par Ok ou Rejected.
