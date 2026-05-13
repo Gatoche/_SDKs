@@ -20,4 +20,11 @@
   <!-- WpsDebugSender est exposé par Wps.Module.Sdk.Core (qui l'embarque). Pas besoin de le
        réinclure ici en source-link, sinon CS0436 (type dupliqué). -->
 
+  <ItemGroup>
+    <!-- Watchdog Sleep/Resume centralisé (_libs). Source-linké ici plutôt que dans Core
+         car SystemEvents.PowerModeChanged nécessite le runtime Windows Desktop
+         (Core cible net8.0 neutre). -->
+    <Compile Include="..\..\..\_libs\WpsPowerWatchdog.cs" Link="WpsPowerWatchdog.cs" />
+  </ItemGroup>
+
 </Project>

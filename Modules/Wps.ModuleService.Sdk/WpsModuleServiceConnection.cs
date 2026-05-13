@@ -45,6 +45,13 @@ internal sealed class WpsModuleServiceConnection : IDisposable
     /// <summary>(v1.3) Timestamp UTC du dernier PING reçu — pour watchdog "host figé".</summary>
     public DateTime LastPingReceivedUtc { get; private set; } = DateTime.UtcNow;
 
+    /// <summary>Reset le timestamp watchdog comme si on venait de recevoir un PING frais.
+    /// Utilisé au retour de veille Windows (cf. <see cref="wipisoft.WpsPowerWatchdog"/>) pour
+    /// éviter que le watchdog ne déclenche HeartbeatSilent immédiatement au réveil — pendant
+    /// le sommeil aucun PING n'a pu être échangé, le silence accumulé n'est pas un signal
+    /// "host mort".</summary>
+    public void ResetHeartbeatTimestamp() => LastPingReceivedUtc = DateTime.UtcNow;
+
     /// <summary>Expose le pipe duplex pour permettre à <see cref="WpsModuleService"/> de
     /// s'abonner à <see cref="WpsPipeDuplex.Closed"/> et déclencher
     /// <see cref="IWpsModule.OnHostDisconnected"/>(PipeClosed).</summary>

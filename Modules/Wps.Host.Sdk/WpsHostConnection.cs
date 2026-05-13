@@ -1,4 +1,5 @@
 using System.Globalization;
+using wipisoft;
 using Wps.Module.Core;
 
 namespace Wps.Module.Hosting;
@@ -141,16 +142,26 @@ internal sealed class WpsHostConnection : IDisposable
         _lastPongUtc = DateTime.UtcNow;
         _hangSignaled = false;
         _heartbeatTimer = new System.Threading.Timer(OnHeartbeatTick, null, PING_INTERVAL_MS, PING_INTERVAL_MS);
+        // S'abonner à Resume : sans reset au réveil, le silence accumulé pendant la veille
+        // (PONG_TIMEOUT_SEC dépassé largement) ferait basculer le slot en hung immédiatement
+        // et l'orchestrateur shutdown killerait le module alors qu'il vient juste de
+        // reprendre son pipe IPC.
+        WpsPowerWatchdog.Resume += OnSystemResume;
     }
 
     public void StopHeartbeat()
     {
+        try { WpsPowerWatchdog.Resume -= OnSystemResume; } catch { /* tolérant */ }
         _heartbeatTimer?.Dispose();
         _heartbeatTimer = null;
     }
 
     private async void OnHeartbeatTick(object? _)
     {
+        // Court-circuit pendant la veille : le PING ne servirait à rien (le module dort
+        // lui aussi) et le check de timeout est trompeur (le silence est attendu).
+        if (WpsPowerWatchdog.IsSuspended) return;
+
         try { await _duplex.SendAsync(WpsModuleContract.CmdPing).ConfigureAwait(false); }
         catch { /* IPC dead → on vérifie quand même le timeout ci-dessous */ }
 
@@ -161,6 +172,24 @@ internal sealed class WpsHostConnection : IDisposable
             WpsDebugSender.Log($"HEARTBEAT: pas de PONG depuis {elapsed.TotalSeconds:F1}s — module figé (UI thread bloqué)", LogLevel.Warning, LogTag);
             HungStateChanged?.Invoke(true);
         }
+    }
+
+    /// <summary>Handler du <see cref="WpsPowerWatchdog.Resume"/> : reset <c>_lastPongUtc</c>
+    /// comme si on venait de recevoir un PONG frais. Si le slot était signalé hung pendant la
+    /// veille (cas où le Suspend a fire mais le watchdog avait déjà basculé avant), on lève
+    /// aussi le flag pour éviter qu'un éventuel orchestrateur shutdown ne kill le module au
+    /// réveil. Le module aura ~5s (PING_INTERVAL_MS) avant le prochain check, largement assez
+    /// pour que les pipes IPC reprennent.</summary>
+    private void OnSystemResume()
+    {
+        _lastPongUtc = DateTime.UtcNow;
+        if (_hangSignaled)
+        {
+            _hangSignaled = false;
+            HungStateChanged?.Invoke(false);
+        }
+        WpsDebugSender.Log("System Resume → heartbeat reset (grace period au réveil)",
+            LogLevel.Info, LogTag);
     }
 
     private void Dispatch(string line)

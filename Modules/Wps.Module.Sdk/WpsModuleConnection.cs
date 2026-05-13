@@ -48,6 +48,13 @@ internal sealed class WpsModuleConnection : IDisposable
     /// et on déclenche <see cref="IWpsModule.OnHostDisconnected"/>(HeartbeatSilent).</summary>
     public DateTime LastPingReceivedUtc { get; private set; } = DateTime.UtcNow;
 
+    /// <summary>Reset le timestamp watchdog comme si on venait de recevoir un PING frais.
+    /// Utilisé typiquement au retour de veille Windows (cf. <see cref="wipisoft.WpsPowerWatchdog"/>) :
+    /// pendant le sommeil du PC, aucun PING n'est échangé → sans reset, le watchdog
+    /// déclencherait immédiatement HeartbeatSilent au réveil et killerait le module alors que
+    /// le host est parfaitement vivant.</summary>
+    public void ResetHeartbeatTimestamp() => LastPingReceivedUtc = DateTime.UtcNow;
+
     /// <summary>Expose le pipe duplex pour permettre à <see cref="WpsModule"/> de s'abonner à
     /// l'event <see cref="WpsPipeDuplex.Closed"/> et déclencher
     /// <see cref="IWpsModule.OnHostDisconnected"/>(PipeClosed) à la coupure.</summary>

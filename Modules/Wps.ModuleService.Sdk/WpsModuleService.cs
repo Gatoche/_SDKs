@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Windows;
 using Microsoft.Win32;
+using wipisoft;
 using Wps.Module;
 using Wps.Module.Core;
 
@@ -118,6 +119,11 @@ public static class WpsModuleService
             // une console pure sans Application WPF — le timer ThreadPool fonctionne dans tous
             // les cas.
             StartHeartbeatWatchdog();
+
+            // S'abonner à Resume : pendant la veille du PC, aucun PING n'est échangé.
+            // Sans reset, le watchdog déclencherait immédiatement HeartbeatSilent au réveil
+            // et terminerait le service alors que le host est vivant. Cf. WpsPowerWatchdog.
+            WpsPowerWatchdog.Resume += OnSystemResume;
 
             // (v1.3) Hook Windows SessionEnding : déclenche un CAN_CLOSE local urgent au
             // shutdown OS. Fonctionne au niveau process (message-only window WPF — créée
@@ -237,6 +243,7 @@ public static class WpsModuleService
         }
         await _shutdownTcs.Task;
         try { SystemEvents.SessionEnding -= OnSessionEnding; } catch { /* tolérant */ }
+        try { WpsPowerWatchdog.Resume -= OnSystemResume; } catch { /* tolérant */ }
         _heartbeatWatchdog?.Dispose();
         _heartbeatWatchdog = null;
         _connection?.Dispose();
@@ -285,6 +292,10 @@ public static class WpsModuleService
         _heartbeatWatchdog = new System.Threading.Timer(_ =>
         {
             if (_connection is null || _hostDisconnected) return;
+            // Court-circuit pendant la veille : pas de PING possible, le timestamp ne peut
+            // pas avancer. Défensif au cas où le tick fire avant que l'event Resume soit
+            // propagé (timing serré au réveil).
+            if (WpsPowerWatchdog.IsSuspended) return;
             var silenceSecs = (DateTime.UtcNow - _connection.LastPingReceivedUtc).TotalSeconds;
             if (silenceSecs > HEARTBEAT_SILENCE_TIMEOUT_SECONDS)
             {
@@ -328,6 +339,18 @@ public static class WpsModuleService
 
         // Débloque RunAsync (idempotent grâce au TCS)
         _shutdownTcs.TrySetResult(true);
+    }
+
+    /// <summary>Handler du <see cref="WpsPowerWatchdog.Resume"/> : reset le timestamp PING comme
+    /// si on venait d'en recevoir un frais. Sans ce reset, le watchdog déclencherait
+    /// HeartbeatSilent immédiatement au réveil (le silence accumulé pendant la veille
+    /// dépasse 30s) et terminerait le service alors que le host est vivant.</summary>
+    private static void OnSystemResume()
+    {
+        if (_connection is null) return;
+        _connection.ResetHeartbeatTimestamp();
+        WpsDebugSender.Log("System Resume → heartbeat watchdog reset (grace period au réveil)",
+            LogLevel.Info, _logTag);
     }
 
     /// <summary>(v1.3) Handler du hook <c>SystemEvents.SessionEnding</c> côté ModuleService.

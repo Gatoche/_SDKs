@@ -41,6 +41,11 @@
     <Compile Include="..\..\..\_libs\WpsTitleBar.xaml.cs" Link="Ui\WpsTitleBar.xaml.cs">
       <DependentUpon>WpsTitleBar.xaml</DependentUpon>
     </Compile>
+
+    <!-- Watchdog Sleep/Resume centralisé (_libs). Permet au Host de reset son
+         _lastPongUtc au retour de veille pour ne pas considérer chaque module comme
+         "hung" alors qu'on vient juste de réveiller le PC. -->
+    <Compile Include="..\..\..\_libs\WpsPowerWatchdog.cs" Link="WpsPowerWatchdog.cs" />
   </ItemGroup>
 
 </Project>
