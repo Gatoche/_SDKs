@@ -22,10 +22,6 @@
          (cf. BringToForegroundAndClick). Source-linké aussi par les apps standalone
          qui en ont besoin pour traiter les double-clics sur leur launcher. -->
     <Compile Include="..\..\..\_libs\WpsForegroundBringer.cs" Link="WpsForegroundBringer.cs" />
-
-    <!-- Watchdog Sleep/Resume centralisé (_libs). Idem côté Module.Sdk : permet aux
-         services de reset leur timestamp watchdog au retour de veille. -->
-    <Compile Include="..\..\..\_libs\WpsPowerWatchdog.cs" Link="WpsPowerWatchdog.cs" />
   </ItemGroup>
 
 </Project>

@@ -1,5 +1,4 @@
 using System.Globalization;
-using wipisoft;
 using Wps.Module.Core;
 
 namespace Wps.Module.Hosting;
@@ -18,6 +17,7 @@ internal sealed class WpsHostConnection : IDisposable
     // Heartbeat
     private System.Threading.Timer? _heartbeatTimer;
     private DateTime _lastPongUtc;
+    private DateTime _lastTickUtc;
     private bool _hangSignaled;
     private const int PING_INTERVAL_MS = 5000;
     private const int PONG_TIMEOUT_SEC = 8;
@@ -140,32 +140,45 @@ internal sealed class WpsHostConnection : IDisposable
     {
         if (_heartbeatTimer is not null) return;
         _lastPongUtc = DateTime.UtcNow;
+        _lastTickUtc = DateTime.UtcNow;
         _hangSignaled = false;
         _heartbeatTimer = new System.Threading.Timer(OnHeartbeatTick, null, PING_INTERVAL_MS, PING_INTERVAL_MS);
-        // S'abonner à Resume : sans reset au réveil, le silence accumulé pendant la veille
-        // (PONG_TIMEOUT_SEC dépassé largement) ferait basculer le slot en hung immédiatement
-        // et l'orchestrateur shutdown killerait le module alors qu'il vient juste de
-        // reprendre son pipe IPC.
-        WpsPowerWatchdog.Resume += OnSystemResume;
     }
 
     public void StopHeartbeat()
     {
-        try { WpsPowerWatchdog.Resume -= OnSystemResume; } catch { /* tolérant */ }
         _heartbeatTimer?.Dispose();
         _heartbeatTimer = null;
     }
 
     private async void OnHeartbeatTick(object? _)
     {
-        // Court-circuit pendant la veille : le PING ne servirait à rien (le module dort
-        // lui aussi) et le check de timeout est trompeur (le silence est attendu).
-        if (WpsPowerWatchdog.IsSuspended) return;
+        // Heuristique "saut temporel" : delta avec le tick précédent > 3× l'intervalle →
+        // on a "dormi" entre les 2 ticks. Couvre veille (S3), hibernation (S4), Modern
+        // Standby (S0Low), freeze GC long, breakpoint debugger. Approche auto-détective,
+        // pas de dépendance sur SystemEvents.PowerMode (qui rate parfois — Modern Standby
+        // ARM notamment). Symétrique au côté module/service.
+        var now = DateTime.UtcNow;
+        var gapMs = (now - _lastTickUtc).TotalMilliseconds;
+        _lastTickUtc = now;
+        if (gapMs > PING_INTERVAL_MS * 3)
+        {
+            WpsDebugSender.Log(
+                $"Heartbeat tick gap {gapMs:F0}ms (attendu ~{PING_INTERVAL_MS}ms) → veille/freeze détecté, reset heartbeat",
+                LogLevel.Info, LogTag);
+            _lastPongUtc = now;
+            if (_hangSignaled)
+            {
+                _hangSignaled = false;
+                HungStateChanged?.Invoke(false);
+            }
+            return;
+        }
 
         try { await _duplex.SendAsync(WpsModuleContract.CmdPing).ConfigureAwait(false); }
         catch { /* IPC dead → on vérifie quand même le timeout ci-dessous */ }
 
-        var elapsed = DateTime.UtcNow - _lastPongUtc;
+        var elapsed = now - _lastPongUtc;
         if (!_hangSignaled && elapsed.TotalSeconds > PONG_TIMEOUT_SEC)
         {
             _hangSignaled = true;
