@@ -29,6 +29,18 @@
          WpsModuleMetadata reste dans _libs (utilisé aussi par wipiManager.DevAll pour lister
          les props des apps wipiSoft, hors contexte Module/Host). -->
     <Compile Include="..\..\..\_libs\WpsModuleMetadata.cs" Link="WpsModuleMetadata.cs" />
+
+    <!-- WpsTitleBar : barre de titre custom partagée entre Host SDK et Apps SDK (standalone).
+         Vit dans _libs, inclue ici via Compile+Page. Règle : une app inclut WpsTitleBar via
+         _libs OU réfère un SDK qui l'inclut déjà (Wps.Host.Sdk / Wps.Apps.Sdk), pas les
+         deux — sinon CS0436 (doublon de types). -->
+    <Page Include="..\..\..\_libs\WpsTitleBar.xaml" Link="Ui\WpsTitleBar.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Compile Include="..\..\..\_libs\WpsTitleBar.xaml.cs" Link="Ui\WpsTitleBar.xaml.cs">
+      <DependentUpon>WpsTitleBar.xaml</DependentUpon>
+    </Compile>
   </ItemGroup>
 
 </Project>

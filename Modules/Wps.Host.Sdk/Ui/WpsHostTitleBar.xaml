@@ -1,0 +1,15 @@
+<UserControl x:Class="Wps.Module.Hosting.Ui.WpsHostTitleBar"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:wpsui="clr-namespace:wipisoft.Ui"
+             x:Name="Root">
+    <!-- Wrapper du WpsTitleBar de _libs. Le SDK Host ajoute la sémantique
+         HostName/SlotName : 2 DependencyProperties pilotées par le caller, composées en
+         "HostName — SlotName" et injectées dans WpsTitleBar.Title. La WpsTitleBar elle-même
+         (dans _libs) reste générique avec une simple prop Title — utilisable telle quelle
+         par les apps standalone qui n'ont pas la notion de Slot. -->
+    <wpsui:WpsTitleBar x:Name="Inner"
+                       IsHostActive="{Binding ElementName=Root, Path=IsHostActive}" />
+    <!-- (TEMPORAIREMENT DÉSACTIVÉ : LeftActionClick="OnInnerLeftActionClick" — cf. fichier
+          .xaml.cs pour le bloc commenté correspondant.) -->
+</UserControl>
