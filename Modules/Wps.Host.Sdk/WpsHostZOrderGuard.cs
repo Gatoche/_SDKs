@@ -1,3 +1,71 @@
+// ============================================================================
+// La saga des 9 heures sur la page noire au hover des boutons système custom
+// ============================================================================
+//
+// Origine : observé d'abord côté ModuloSlot.Host après introduction de la titlebar
+// custom WpsHostTitleBar (WindowChrome + WindowStyle=None). Symptôme : au survol
+// (sans clic) des boutons Réduire / Agrandir / Fermer, le pageslot du module
+// actif passe brièvement au noir ou affiche un snapshot stale, et le module ne
+// réagit plus aux clics. Le natif du module est techniquement toujours visible,
+// juste physiquement masqué.
+//
+// 9 heures de debug + ~25 fausses pistes avant d'identifier la cause root :
+//   - Filtre Deactivated avec fgIsNull (transitions Windows momentanées) ✓
+//     utile mais insuffisant
+//   - Projection.Source = null après ShowOverlay (mitigation symptôme : noir
+//     pur plutôt que snapshot trompeur) ✓ gardé côté host
+//   - Timer différé 150ms sur Deactivated externe (annule park si souris
+//     revient) ✓ gardé côté host
+//   - SetForeground(module) en fin de fade-out cross-fade ✗ casse les
+//     transitions suivantes
+//   - WS_EX_NOACTIVATE sur le HWND module ✗ inefficace
+//   - Commande IPC SELF_FOREGROUND (module se foregrounde lui-même) ✗
+//     inefficace (restrictions Win32 cross-process)
+//   - RedrawWindow périodique sur natif (théorie DWM frozen frame) ✗
+//     inefficace
+//   - Poll côté SDK module pour observer son propre état ✓ utile pour
+//     diagnostic
+//   - Hook WM_WINDOWPOSCHANGED/WM_SHOWWINDOW côté module ✓ utile : a confirmé
+//     que le HWND module NE REÇOIT AUCUN message Win32 pendant le bug
+//   - Hotkey global Ctrl+Shift+D pour dump diagnostic on-demand (z-order chain
+//     complète + descripteur HWND tiers) ⭐ a permis d'identifier la cause root
+//
+// Cause root identifiée via dumps Ctrl+Shift+D (comparaison z-order chain
+// AVANT/APRÈS bug) :
+//   - AVANT bug : hwndPrev[+1] du natif = 'Hidden Window' (interne Host
+//     inoffensive)
+//   - APRÈS bug : hwndPrev[+1] du natif = 'ModuloSlot - Host' (la WPF
+//     MainWindow principale est passée AU-DESSUS du natif dans le z-order)
+//
+// Explication technique : WindowChromeWorker (interne WPF), au hover des
+// boutons système custom, traite des messages NC (WM_NCHITTEST,
+// WM_NCMOUSEMOVE) qui déclenchent un SetWindowPos parasite sur la fenêtre
+// host modifiant son z-order. Le host main passe alors au-dessus du natif
+// Module qui avait été positionné par-dessus via SetWindowPos cross-process.
+// Le natif est donc physiquement caché derrière la zone WPF noire du
+// pageslot — sans que son HWND ne reçoive aucun message Win32.
+//
+// Fix réactif (cette classe) : intercepter WM_WINDOWPOSCHANGED sur le host.
+// Si le z-order a été modifié (flag SWP_NOZORDER absent), refaire
+// immédiatement un flip TOPMOST → NOTOPMOST sur le HWND du natif visible.
+//
+// TODO refactor préemptif : intercepter WM_WINDOWPOSCHANGING (qui fire AVANT
+// le changement) et forcer SWP_NOZORDER dans les flags pour annuler le
+// changement directement, plutôt que de le réverser après. Première tentative
+// échouée car le filtre hwndInsertAfter == HWND_TOP ne couvre pas tous les
+// cas — WindowChrome utilise d'autres valeurs. Approche à raffiner avec une
+// heuristique plus fine (peut-être par tracking des messages NC précédents).
+// Le fix réactif actuel est fonctionnel et stable, mais préemptif éviterait
+// le bref flash invisible du changement-puis-réversion.
+//
+// Leçon : quand un bug visuel se manifeste sans aucun log côté code
+// applicatif, c'est un bug de z-order Win32 ou de rendering DWM. L'arsenal de
+// diagnostic à 3 niveaux (poll module 2s, hook WM_* côté module, dump
+// on-demand de la z-order chain) a été décisif pour localiser. À
+// industrialiser pour les futurs bugs similaires.
+//
+// ============================================================================
+
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
