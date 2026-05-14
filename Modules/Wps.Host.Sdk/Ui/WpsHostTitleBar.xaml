@@ -2,14 +2,191 @@
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:wpsui="clr-namespace:wipisoft.Ui"
+             xmlns:host="clr-namespace:Wps.Module.Hosting.Ui"
              x:Name="Root">
+    <UserControl.Resources>
+        <!-- Style des 3 boutons à droite injectés dans WpsTitleBar.RightExtras (Services,
+             Search, Help). Calqué sur le style des boutons système Min/Max/Close (Segoe MDL2
+             Assets, fond transparent, hover #3A3A3C). ToggleStyle dérivé pour Services qui
+             reste sur fond bleu (#3A7BBF) quand IsChecked=True. -->
+        <Style x:Key="HostRightBtn" TargetType="Button">
+            <Setter Property="Width" Value="46"/>
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#D0D6DE"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <!-- Bg : fond du bouton (transparent par défaut, gris au hover, plus
+                             sombre au clic).
+                             Content : ContentPresenter wrappé dans un élément nommé pour
+                             pouvoir griser via Opacity quand IsEnabled=False (sans bloquer
+                             les triggers hover/pressed du Bg). -->
+                        <Border x:Name="Bg" Background="{TemplateBinding Background}">
+                            <ContentPresenter x:Name="Content"
+                                              HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#3A3A3C"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bg" Property="Background" Value="#2A2A2C"/>
+                            </Trigger>
+                            <!-- État désactivé : icône grisée (40% opacité), pas de feedback
+                                 hover/pressed (Cursor reverte à Arrow par défaut WPF quand
+                                 IsEnabled=False). Permet au caller de griser le bouton (ex:
+                                 toggle leftpanel inactif quand on n'est pas sur la section
+                                 Modules) tout en gardant l'icône visible (indication "ce
+                                 bouton existe mais n'a pas d'effet ici"). -->
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Content" Property="Opacity" Value="0.4"/>
+                                <Setter Property="Cursor" Value="Arrow"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="HostRightToggle" TargetType="RadioButton">
+            <Setter Property="Width" Value="46"/>
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#D0D6DE"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Focusable" Value="False"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <!-- 2 Border imbriqués :
+                             - HoverBg : pleine taille (46x36), porte le feedback hover/pressed
+                               (fond gris au survol, plus sombre au clic) — pas de fond bleu.
+                             - Frame : plus petit (Margin 4 → 38x28), coins arrondis 8px,
+                               sert de cadre bleu autour de l'icône quand IsChecked. -->
+                        <Border x:Name="HoverBg" Background="{TemplateBinding Background}">
+                            <Border x:Name="Frame"
+                                    BorderBrush="Transparent"
+                                    BorderThickness="2"
+                                    CornerRadius="8"
+                                    Margin="4">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Frame" Property="BorderBrush" Value="#3A7BBF"/>
+                            </Trigger>
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="IsMouseOver" Value="True"/>
+                                    <Condition Property="IsChecked" Value="False"/>
+                                </MultiTrigger.Conditions>
+                                <Setter TargetName="HoverBg" Property="Background" Value="#3A3A3C"/>
+                            </MultiTrigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="HoverBg" Property="Background" Value="#2A2A2C"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </UserControl.Resources>
     <!-- Wrapper du WpsTitleBar de _libs. Le SDK Host ajoute la sémantique
          HostName/SlotName : 2 DependencyProperties pilotées par le caller, composées en
          "HostName — SlotName" et injectées dans WpsTitleBar.Title. La WpsTitleBar elle-même
          (dans _libs) reste générique avec une simple prop Title — utilisable telle quelle
          par les apps standalone qui n'ont pas la notion de Slot. -->
     <wpsui:WpsTitleBar x:Name="Inner"
-                       IsHostActive="{Binding ElementName=Root, Path=IsHostActive}" />
-    <!-- (TEMPORAIREMENT DÉSACTIVÉ : LeftActionClick="OnInnerLeftActionClick" — cf. fichier
-          .xaml.cs pour le bloc commenté correspondant.) -->
+                       IsHostActive="{Binding ElementName=Root, Path=IsHostActive}">
+        <!-- Boutons à GAUCHE via LeftExtras (entre l'icône Window et le titre centré).
+             Section 0 = Toggle leftpanel (réduire/déplier le volet latéral du host) — Button
+             local au wrapper, glyph et tooltip pilotés par les DPs LeftPaneToggleGlyph /
+             LeftPaneToggleTooltip via ApplyLeftActionVisual selon IsLeftPaneOpen.
+             Sections 1-4 = 4 RadioButton de navigation top-level partageant GroupName="TopSections"
+             (Window-scoped → mutuellement exclusifs). Ces 4 boutons pilotent un TabControl à 4
+             TabItems côté caller (Modules / Services / Système / Gestionnaire).
+             Style HostRightToggle = cadre bleu (#3A7BBF) 2px CornerRadius 8 autour de l'icône
+             quand IsChecked. Glyphs Segoe MDL2 Assets.
+             (x:Name volontairement absent sur les RadioButton — UIElements injectés dans un
+             autre namescope via le ContentPresenter LeftExtras de WpsTitleBar.) -->
+        <wpsui:WpsTitleBar.LeftExtras>
+            <StackPanel Orientation="Horizontal">
+                <!-- RelativeSource AncestorType utilisé au lieu d'ElementName=Root car
+                     ces UIElements sont injectés via LeftExtras dans le ContentPresenter de
+                     WpsTitleBar (cross-namescope) — l'ElementName=Root ne se résout pas
+                     toujours dans ce contexte. RelativeSource cherche dans le visual tree
+                     ascendant au runtime et fonctionne de manière fiable. -->
+                <Button Style="{StaticResource HostRightBtn}"
+                        FontSize="18"
+                        Content="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=LeftPaneToggleGlyph}"
+                        ToolTip="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=LeftPaneToggleTooltip}"
+                        IsEnabled="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsLeftPaneToggleEnabled}"
+                        Click="OnLeftPaneToggleClick" />
+
+                <!-- Petit séparateur visuel pour distinguer le toggle pane (action locale au
+                     leftpanel) du groupe des 4 sections top-level. 8 px de respiration. -->
+                <Border Width="1" Margin="6,8,6,8" Background="#3F3F46" />
+
+                <!-- Section "Modules" : sidebar modules + module embedded. Glyph E71D
+                     (AllApps en Segoe MDL2). Par défaut sélectionné au boot. -->
+                <RadioButton Style="{StaticResource HostRightToggle}"
+                             GroupName="TopSections"
+                             Content="&#xE71D;"
+                             ToolTip="Modules"
+                             Click="OnModulesClick"
+                             IsChecked="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsModulesSelected, Mode=TwoWay}" />
+
+                <!-- Section "Services" : panneau services + service control page. Glyph E713
+                     (Settings/engrenage). -->
+                <RadioButton Style="{StaticResource HostRightToggle}"
+                             GroupName="TopSections"
+                             Content="&#xE713;"
+                             ToolTip="Services"
+                             Click="OnServicesClick"
+                             IsChecked="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsServicesSelected, Mode=TwoWay}" />
+
+                <!-- Section "Système" : page Système (anciennement bouton en bas de la sidebar
+                     Modules — déplacé ici pour homogénéité top-level). Glyph E9D9
+                     (BarChart4 en Segoe MDL2). -->
+                <RadioButton Style="{StaticResource HostRightToggle}"
+                             GroupName="TopSections"
+                             Content="&#xE9D9;"
+                             ToolTip="Système"
+                             Click="OnSystemClick"
+                             IsChecked="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsSystemSelected, Mode=TwoWay}" />
+
+                <!-- Section "Gestionnaire" : placeholder. À terme, lance wipiManager.Service
+                     comme module embarqué. Glyph E8AE (placeholder — à ajuster plus tard). -->
+                <RadioButton Style="{StaticResource HostRightToggle}"
+                             GroupName="TopSections"
+                             Content="&#xE8AE;"
+                             ToolTip="Gestionnaire"
+                             Click="OnManagerClick"
+                             IsChecked="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsManagerSelected, Mode=TwoWay}" />
+            </StackPanel>
+        </wpsui:WpsTitleBar.LeftExtras>
+        <!-- 2 boutons à droite (avant Min/Max/Close), pattern Word/Outlook :
+             - Search (loupe E721) + Help (? E897) : Button simples, RoutedEvent pour câblage
+               caller. Placeholder (pas encore câblés à une fonctionnalité réelle). -->
+        <wpsui:WpsTitleBar.RightExtras>
+            <StackPanel Orientation="Horizontal">
+                <Button Style="{StaticResource HostRightBtn}"
+                        Content="&#xE721;"
+                        ToolTip="Rechercher"
+                        Click="OnSearchClick" />
+                <Button Style="{StaticResource HostRightBtn}"
+                        Content="&#xE897;"
+                        ToolTip="Aide"
+                        Click="OnHelpClick" />
+            </StackPanel>
+        </wpsui:WpsTitleBar.RightExtras>
+    </wpsui:WpsTitleBar>
 </UserControl>

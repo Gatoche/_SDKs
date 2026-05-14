@@ -64,11 +64,6 @@ public partial class WpsHostTitleBar : UserControl
         set => SetValue(IsHostActiveProperty, value);
     }
 
-    // (TEMPORAIREMENT DÉSACTIVÉ — investigation bug "page noire / snapshot obsolète" au
-    // survol du LeftActionBtn de la WpsTitleBar enfant. On commente tout le bloc lié au
-    // pane gauche pour isoler. Re-activer en retirant le /* */ ci-dessous et en restaurant
-    // LeftActionClick="OnInnerLeftActionClick" dans le XAML.)
-    /*
     /// <summary>État 2-positions du bouton d'action gauche (typiquement représente un pane
     /// latéral du host : ouvert ou fermé). Par défaut <c>true</c> (= ouvert). Le SDK met à
     /// jour le glyph + tooltip de la WpsTitleBar enfant à chaque changement, et toggle cette
@@ -97,35 +92,252 @@ public partial class WpsHostTitleBar : UserControl
         if (d is WpsHostTitleBar bar) bar.ApplyLeftActionVisual();
     }
 
-    /// <summary>Met à jour le glyph + tooltip de la WpsTitleBar enfant selon l'état courant
-    /// de <see cref="IsLeftPaneOpen"/>. Glyphs Segoe MDL2 Assets :
+    /// <summary>Glyph affiché dans le bouton de réduction du leftpanel (injecté dans
+    /// <c>LeftExtras</c> de la WpsTitleBar enfant). Bindé en XAML, mis à jour par
+    /// <see cref="ApplyLeftActionVisual"/> selon <see cref="IsLeftPaneOpen"/>. DP interne,
+    /// pas destinée à être set par le caller.</summary>
+    public static readonly DependencyProperty LeftPaneToggleGlyphProperty =
+        DependencyProperty.Register(nameof(LeftPaneToggleGlyph), typeof(string), typeof(WpsHostTitleBar),
+            new PropertyMetadata(""));  // OpenPane par défaut (état IsLeftPaneOpen=true)
+
+    public string? LeftPaneToggleGlyph
+    {
+        get => (string?)GetValue(LeftPaneToggleGlyphProperty);
+        set => SetValue(LeftPaneToggleGlyphProperty, value);
+    }
+
+    /// <summary>Tooltip affiché sur le bouton de réduction du leftpanel. Mis à jour par
+    /// <see cref="ApplyLeftActionVisual"/>. DP interne.</summary>
+    public static readonly DependencyProperty LeftPaneToggleTooltipProperty =
+        DependencyProperty.Register(nameof(LeftPaneToggleTooltip), typeof(string), typeof(WpsHostTitleBar),
+            new PropertyMetadata("Masquer le volet latéral"));
+
+    public string? LeftPaneToggleTooltip
+    {
+        get => (string?)GetValue(LeftPaneToggleTooltipProperty);
+        set => SetValue(LeftPaneToggleTooltipProperty, value);
+    }
+
+    /// <summary>Active ou désactive le bouton de réduction/expansion du leftpanel. Default
+    /// <c>true</c>. Le caller peut le mettre à <c>false</c> pour griser le bouton quand le
+    /// leftpanel n'est pas pertinent dans la section courante (typiquement : le host ne
+    /// montre la sidebar Modules que sur la section Modules ; sur Services/Système/etc.,
+    /// le toggle n'a pas d'effet visible → autant le désactiver visuellement).
+    /// <para>Le style XAML <c>HostRightBtn</c> rend l'icône à 40% d'opacité quand IsEnabled
+    /// est false (cf. Trigger).</para></summary>
+    public static readonly DependencyProperty IsLeftPaneToggleEnabledProperty =
+        DependencyProperty.Register(nameof(IsLeftPaneToggleEnabled), typeof(bool), typeof(WpsHostTitleBar),
+            new PropertyMetadata(true));
+
+    public bool IsLeftPaneToggleEnabled
+    {
+        get => (bool)GetValue(IsLeftPaneToggleEnabledProperty);
+        set => SetValue(IsLeftPaneToggleEnabledProperty, value);
+    }
+
+    /// <summary>Met à jour le glyph + tooltip du bouton de réduction du leftpanel (injecté
+    /// via LeftExtras) selon <see cref="IsLeftPaneOpen"/>. Glyphs Segoe MDL2 Assets :
     /// <list type="bullet">
-    ///   <item>U+E89F = ClosePane (pane est ouvert, clic pour fermer)</item>
-    ///   <item>U+E8A0 = OpenPane (pane est fermé, clic pour ouvrir)</item>
+    ///   <item>U+E89F = ClosePane (panneau fermé → chevrons vers la droite, "ouvrir")</item>
+    ///   <item>U+E8A0 = OpenPane (panneau ouvert → chevrons vers la gauche, "fermer")</item>
     /// </list>
-    /// Escape Unicode explicite (\u) plutôt que caractères littéraux pour éviter que les
-    /// glyphs de la Private Use Area soient avalés par éditeurs / clipboard.</summary>
+    /// Escape Unicode explicite <c>\uXXXX</c> plutôt que caractères littéraux pour éviter que
+    /// les glyphs de la Private Use Area soient avalés par éditeurs / clipboard.</summary>
     private void ApplyLeftActionVisual()
     {
-        if (Inner is null) return;
         if (IsLeftPaneOpen)
         {
-            Inner.LeftActionGlyph = "";  // ClosePane
-            Inner.LeftActionTooltip = "Masquer le volet latéral";
+            LeftPaneToggleGlyph = "";   // OpenPane (suggère "fermer/replier")
+            LeftPaneToggleTooltip = "Masquer le volet latéral";
         }
         else
         {
-            Inner.LeftActionGlyph = "";  // OpenPane
-            Inner.LeftActionTooltip = "Afficher le volet latéral";
+            LeftPaneToggleGlyph = "";   // ClosePane (suggère "ouvrir/déplier")
+            LeftPaneToggleTooltip = "Afficher le volet latéral";
         }
     }
 
-    private void OnInnerLeftActionClick(object sender, RoutedEventArgs e)
+    private void OnLeftPaneToggleClick(object sender, RoutedEventArgs e)
     {
         // Toggle l'état — le PropertyChangedCallback re-met à jour le glyph automatiquement.
         IsLeftPaneOpen = !IsLeftPaneOpen;
     }
-    */
+
+    // ============================================================
+    // 4 sections top-level pilotées par les 4 RadioButton injectés dans LeftExtras
+    // (GroupName="TopSections" Window-scoped → mutuellement exclusifs).
+    //
+    // Chaque section expose :
+    //   - une DependencyProperty IsXxxSelected (TwoWay binding sur IsChecked du RadioButton),
+    //   - un RoutedEvent XxxClick (raised quand l'utilisateur clique le bouton).
+    //
+    // Le caller (typiquement la MainWindow du host) :
+    //   - lie un TabControl à 4 TabItems sur ces 4 DPs (ou s'abonne via DPD/event),
+    //   - met IsModulesSelected=true au boot pour démarrer sur Modules (default au niveau DP).
+    //
+    // Pourquoi forcer IsXxxSelected = rb.IsChecked dans les handlers Click malgré le binding
+    // TwoWay ? Les RadioButton sont injectés cross-namescope (via le ContentPresenter LeftExtras
+    // de WpsTitleBar), et l'expérience montre que le binding TwoWay ne propage pas toujours
+    // au bon timing dans ce contexte. Le set explicite garantit la cohérence DP ↔ IsChecked
+    // au moment où l'event Click est levé.
+    // ============================================================
+
+    /// <summary>True quand la section Modules est sélectionnée (RadioButton "Modules" coché).
+    /// Default <c>true</c> — section affichée au démarrage du host.</summary>
+    public static readonly DependencyProperty IsModulesSelectedProperty =
+        DependencyProperty.Register(nameof(IsModulesSelected), typeof(bool), typeof(WpsHostTitleBar),
+            new PropertyMetadata(true));
+
+    public bool IsModulesSelected
+    {
+        get => (bool)GetValue(IsModulesSelectedProperty);
+        set => SetValue(IsModulesSelectedProperty, value);
+    }
+
+    /// <summary>True quand la section Services est sélectionnée (RadioButton "Services" coché).
+    /// Default <c>false</c>.</summary>
+    public static readonly DependencyProperty IsServicesSelectedProperty =
+        DependencyProperty.Register(nameof(IsServicesSelected), typeof(bool), typeof(WpsHostTitleBar),
+            new PropertyMetadata(false));
+
+    public bool IsServicesSelected
+    {
+        get => (bool)GetValue(IsServicesSelectedProperty);
+        set => SetValue(IsServicesSelectedProperty, value);
+    }
+
+    /// <summary>True quand la section Système est sélectionnée (RadioButton "Système" coché).
+    /// Default <c>false</c>. Remplace l'ancien NavSystem qui vivait en bas du leftpanel.</summary>
+    public static readonly DependencyProperty IsSystemSelectedProperty =
+        DependencyProperty.Register(nameof(IsSystemSelected), typeof(bool), typeof(WpsHostTitleBar),
+            new PropertyMetadata(false));
+
+    public bool IsSystemSelected
+    {
+        get => (bool)GetValue(IsSystemSelectedProperty);
+        set => SetValue(IsSystemSelectedProperty, value);
+    }
+
+    /// <summary>True quand la section Gestionnaire est sélectionnée (RadioButton "Gestionnaire"
+    /// coché). Default <c>false</c>. Placeholder — à terme, lance wipiManager.Service comme
+    /// module embarqué.</summary>
+    public static readonly DependencyProperty IsManagerSelectedProperty =
+        DependencyProperty.Register(nameof(IsManagerSelected), typeof(bool), typeof(WpsHostTitleBar),
+            new PropertyMetadata(false));
+
+    public bool IsManagerSelected
+    {
+        get => (bool)GetValue(IsManagerSelectedProperty);
+        set => SetValue(IsManagerSelectedProperty, value);
+    }
+
+    /// <summary>Event raised quand l'utilisateur clique le bouton Modules.</summary>
+    public static readonly RoutedEvent ModulesClickEvent =
+        EventManager.RegisterRoutedEvent(nameof(ModulesClick), RoutingStrategy.Bubble,
+            typeof(RoutedEventHandler), typeof(WpsHostTitleBar));
+
+    public event RoutedEventHandler ModulesClick
+    {
+        add => AddHandler(ModulesClickEvent, value);
+        remove => RemoveHandler(ModulesClickEvent, value);
+    }
+
+    /// <summary>Event raised quand l'utilisateur clique le bouton Services.</summary>
+    public static readonly RoutedEvent ServicesClickEvent =
+        EventManager.RegisterRoutedEvent(nameof(ServicesClick), RoutingStrategy.Bubble,
+            typeof(RoutedEventHandler), typeof(WpsHostTitleBar));
+
+    public event RoutedEventHandler ServicesClick
+    {
+        add => AddHandler(ServicesClickEvent, value);
+        remove => RemoveHandler(ServicesClickEvent, value);
+    }
+
+    /// <summary>Event raised quand l'utilisateur clique le bouton Système.</summary>
+    public static readonly RoutedEvent SystemClickEvent =
+        EventManager.RegisterRoutedEvent(nameof(SystemClick), RoutingStrategy.Bubble,
+            typeof(RoutedEventHandler), typeof(WpsHostTitleBar));
+
+    public event RoutedEventHandler SystemClick
+    {
+        add => AddHandler(SystemClickEvent, value);
+        remove => RemoveHandler(SystemClickEvent, value);
+    }
+
+    /// <summary>Event raised quand l'utilisateur clique le bouton Gestionnaire.</summary>
+    public static readonly RoutedEvent ManagerClickEvent =
+        EventManager.RegisterRoutedEvent(nameof(ManagerClick), RoutingStrategy.Bubble,
+            typeof(RoutedEventHandler), typeof(WpsHostTitleBar));
+
+    public event RoutedEventHandler ManagerClick
+    {
+        add => AddHandler(ManagerClickEvent, value);
+        remove => RemoveHandler(ManagerClickEvent, value);
+    }
+
+    /// <summary>Event raised quand l'utilisateur clique le bouton Recherche (loupe) de la barre droite.
+    /// Pas encore câblé côté caller — placeholder pour future fonctionnalité de recherche app-wide.</summary>
+    public static readonly RoutedEvent SearchClickEvent =
+        EventManager.RegisterRoutedEvent(nameof(SearchClick), RoutingStrategy.Bubble,
+            typeof(RoutedEventHandler), typeof(WpsHostTitleBar));
+
+    public event RoutedEventHandler SearchClick
+    {
+        add => AddHandler(SearchClickEvent, value);
+        remove => RemoveHandler(SearchClickEvent, value);
+    }
+
+    /// <summary>Event raised quand l'utilisateur clique le bouton Aide (?) de la barre droite.
+    /// Pas encore câblé côté caller — placeholder pour future fonctionnalité d'aide app-wide.</summary>
+    public static readonly RoutedEvent HelpClickEvent =
+        EventManager.RegisterRoutedEvent(nameof(HelpClick), RoutingStrategy.Bubble,
+            typeof(RoutedEventHandler), typeof(WpsHostTitleBar));
+
+    public event RoutedEventHandler HelpClick
+    {
+        add => AddHandler(HelpClickEvent, value);
+        remove => RemoveHandler(HelpClickEvent, value);
+    }
+
+    // Pattern commun aux 4 handlers des sections top-level : force le sync IsXxxSelected ←
+    // IsChecked du RadioButton avant de lever le RoutedEvent. Le binding TwoWay du XAML est
+    // censé propager, mais en cross-namescope (RadioButton injecté dans le ContentPresenter
+    // LeftExtras de WpsTitleBar), l'expérience a montré des décalages de timing. On force
+    // pour garantir la cohérence DP ↔ IsChecked au moment où le caller reçoit l'event.
+
+    private void OnModulesClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is System.Windows.Controls.RadioButton rb)
+            IsModulesSelected = rb.IsChecked ?? false;
+        RaiseEvent(new RoutedEventArgs(ModulesClickEvent, this));
+    }
+
+    private void OnServicesClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is System.Windows.Controls.RadioButton rb)
+            IsServicesSelected = rb.IsChecked ?? false;
+        RaiseEvent(new RoutedEventArgs(ServicesClickEvent, this));
+    }
+
+    private void OnSystemClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is System.Windows.Controls.RadioButton rb)
+            IsSystemSelected = rb.IsChecked ?? false;
+        RaiseEvent(new RoutedEventArgs(SystemClickEvent, this));
+    }
+
+    private void OnManagerClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is System.Windows.Controls.RadioButton rb)
+            IsManagerSelected = rb.IsChecked ?? false;
+        RaiseEvent(new RoutedEventArgs(ManagerClickEvent, this));
+    }
+
+    private void OnSearchClick(object sender, RoutedEventArgs e)
+        => RaiseEvent(new RoutedEventArgs(SearchClickEvent, this));
+
+    private void OnHelpClick(object sender, RoutedEventArgs e)
+        => RaiseEvent(new RoutedEventArgs(HelpClickEvent, this));
 
     public WpsHostTitleBar()
     {
@@ -149,8 +361,10 @@ public partial class WpsHostTitleBar : UserControl
         // sur les modifications futures).
         RecomputeComposedTitle();
 
-        // (TEMPORAIREMENT DÉSACTIVÉ avec le reste du bloc LeftAction.)
-        // ApplyLeftActionVisual();
+        // Premier calcul du glyph/tooltip du bouton d'action gauche selon l'état initial
+        // de IsLeftPaneOpen (default true). Les PropertyChangedCallback ne déclencheront
+        // que sur les modifications futures.
+        ApplyLeftActionVisual();
     }
 
     private static void OnTitlePartChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
