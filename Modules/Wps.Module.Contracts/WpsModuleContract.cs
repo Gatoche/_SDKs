@@ -38,11 +38,16 @@ public enum WpsModuleKind
 ///   SELF_CLOSING (module se ferme à son initiative). USER_RESPONSE (Host → Module : résultat
 ///   de la modale NEED_USER, le host est responsable de l'affichage). Permet la négociation
 ///   d'arrêt avec veto utilisateur, et grace timeouts confortables — additif
+/// - <b>1.4</b> : SIGNAL (Module → Host) — canal générique de notification métier (nom + payload
+///   string libre, fire-and-forget). Permet au module de notifier le host d'un événement
+///   applicatif spécifique sans étendre le vocabulaire de base du contrat (ex: serveur interne
+///   ready, sync terminée, état métier particulier). Un host v1.3 reçoit le SIGNAL sur le pipe
+///   mais ignore silencieusement (la branche default du dispatch est un no-op) — additif
 /// </summary>
 public static class WpsModuleContract
 {
     /// <summary>Version du contrat module ↔ host (semver "major.minor"). Annoncée au handshake HELLO.</summary>
-    public const string CurrentVersion = "1.3";
+    public const string CurrentVersion = "1.4";
 
     /// <summary>Argument ligne de commande qui passe le sessionId au module : <c>--wps-session XXX</c>.</summary>
     public const string SessionArgFlag = "--wps-session";
@@ -304,4 +309,32 @@ public static class WpsModuleContract
     /// Application.Shutdown. Le host verra <see cref="System.Diagnostics.Process.Exited"/>
     /// peu après et fera le cleanup côté slot.</para></summary>
     public const string NotifSelfClosing = "SELF_CLOSING";
+
+    // ================================================================================
+    // ====== v1.4 : Signal métier générique Module → Host ===========================
+    // ================================================================================
+
+    /// <summary>(v1.4) Signal métier générique du module vers son host. Canal additif
+    /// permettant au module de notifier le host d'un événement applicatif spécifique sans
+    /// nécessiter une extension du vocabulaire de base du contrat — typiquement : un serveur
+    /// interne au module est devenu actif (ex: wipiManager.Server ouvre son listener), une
+    /// synchronisation initiale est terminée, un état métier particulier est atteint.
+    /// <para>Format : <c>SIGNAL|name|payload</c> où :</para>
+    /// <list type="bullet">
+    ///   <item><c>name</c> : identifiant court du signal (ex: <c>"server-ready"</c>,
+    ///         <c>"sync-done"</c>). Ne doit PAS contenir de <c>|</c> — c'est la 2e portion
+    ///         de trame, séparée par <c>|</c>. Convention : kebab-case ASCII.</item>
+    ///   <item><c>payload</c> : texte libre (peut contenir des <c>|</c> — dernière portion
+    ///         de trame, reconstruite via <c>Split(separator, 3)</c> côté parsing). Optionnel,
+    ///         peut être vide. Format applicatif libre (string brut, JSON, etc.).</item>
+    /// </list>
+    /// <para>Fire-and-forget : pas d'ACK du host. Le module n'attend rien après l'envoi.
+    /// Le host route via l'event <c>SignalReceived</c> de <c>WpsHostConnection</c> /
+    /// <c>WpsModuleSlot</c>, charge à l'app host de filtrer par <c>name</c>.</para>
+    /// <para>Compatibilité ascendante : un host plus ancien (v1.3) reçoit le SIGNAL sur le
+    /// pipe mais l'ignore silencieusement (la branche default du dispatch est un no-op),
+    /// pas de perte de fonctionnalité côté host hors signal. Un module v1.3 ne sait pas
+    /// envoyer de SIGNAL — le host v1.4 ne dépendra pas du signal pour les modules
+    /// historiques.</para></summary>
+    public const string NotifSignal = "SIGNAL";
 }

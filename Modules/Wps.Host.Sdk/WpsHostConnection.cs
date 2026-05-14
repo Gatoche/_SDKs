@@ -69,6 +69,13 @@ internal sealed class WpsHostConnection : IDisposable
     /// (état "Closed" plutôt que "Failed").</summary>
     public event Action<string>? SelfClosing;
 
+    /// <summary>(v1.4) Émis à réception de <c>SIGNAL|name|payload</c> du module. Arguments :
+    /// <c>(name, payload)</c>. Le <c>name</c> est l'identifiant court du signal (ex:
+    /// <c>"server-ready"</c>) ; le <c>payload</c> est un texte libre applicatif (peut être
+    /// vide, peut contenir des <c>|</c>). L'app host filtre par <c>name</c> pour router vers
+    /// la logique métier appropriée (activer un bouton UI, déclencher un état, etc.).</summary>
+    public event Action<string, string>? SignalReceived;
+
     private const string LogTag = "Wps.Host.Sdk";
 
     public WpsHostConnection(string sessionId)
@@ -272,6 +279,21 @@ internal sealed class WpsHostConnection : IDisposable
         {
             var p = line.Split(WpsModuleContract.Separator, 2);
             if (p.Length >= 2) SelfClosing?.Invoke(p[1]);
+            return;
+        }
+        // (v1.4) SIGNAL|name|payload : name interdit de '|' (2e portion), payload libre (3e
+        // portion, peut contenir des '|') → Split(separator, 3) préserve le payload intact.
+        if (line.StartsWith(WpsModuleContract.NotifSignal + WpsModuleContract.Separator, StringComparison.Ordinal))
+        {
+            var p = line.Split(WpsModuleContract.Separator, 3);
+            if (p.Length >= 2)
+            {
+                var name = p[1];
+                var payload = p.Length >= 3 ? p[2] : "";
+                WpsDebugSender.Log($"received SIGNAL name='{name}' payloadLen={payload.Length}",
+                    LogLevel.Info, LogTag);
+                SignalReceived?.Invoke(name, payload);
+            }
             return;
         }
 

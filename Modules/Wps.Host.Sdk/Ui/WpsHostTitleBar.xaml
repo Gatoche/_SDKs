@@ -5,6 +5,10 @@
              xmlns:host="clr-namespace:Wps.Module.Hosting.Ui"
              x:Name="Root">
     <UserControl.Resources>
+        <!-- Converter BoolToVisibility (true → Visible, false → Collapsed). Utilisé par le
+             RadioButton Gestionnaire pour masquer complètement le bouton via IsManagerVisible. -->
+        <BooleanToVisibilityConverter x:Key="BoolToVisibilityConv" />
+
         <!-- Style des 3 boutons à droite injectés dans WpsTitleBar.RightExtras (Services,
              Search, Help). Calqué sur le style des boutons système Min/Max/Close (Segoe MDL2
              Assets, fond transparent, hover #3A3A3C). ToggleStyle dérivé pour Services qui
@@ -76,7 +80,8 @@
                                     BorderThickness="2"
                                     CornerRadius="8"
                                     Margin="4">
-                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                <ContentPresenter x:Name="Content"
+                                                  HorizontalAlignment="Center" VerticalAlignment="Center"/>
                             </Border>
                         </Border>
                         <ControlTemplate.Triggers>
@@ -92,6 +97,15 @@
                             </MultiTrigger>
                             <Trigger Property="IsPressed" Value="True">
                                 <Setter TargetName="HoverBg" Property="Background" Value="#2A2A2C"/>
+                            </Trigger>
+                            <!-- État désactivé : icône grisée (40% opacité), pas de hover/pressed
+                                 feedback (cursor Arrow par défaut WPF). Permet au caller de griser
+                                 le bouton (ex: Gestionnaire au boot avant signal server-ready) tout
+                                 en gardant l'icône visible (indication "ce bouton existe mais n'est
+                                 pas encore actif"). -->
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Content" Property="Opacity" Value="0.4"/>
+                                <Setter Property="Cursor" Value="Arrow"/>
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -164,27 +178,38 @@
                              IsChecked="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsSystemSelected, Mode=TwoWay}" />
 
                 <!-- Section "Gestionnaire" : placeholder. À terme, lance wipiManager.Service
-                     comme module embarqué. Glyph E8AE (placeholder — à ajuster plus tard). -->
+                     comme module embarqué. Glyph E8AE (placeholder — à ajuster plus tard).
+                     IsEnabled bindé à IsManagerEnabled (grisé au boot tant que le serveur
+                     interne wipiManager.Server n'a pas signalé "server-ready"). Visibility
+                     bindée à IsManagerVisible (bouton caché si le poste n'est pas serveur). -->
                 <RadioButton Style="{StaticResource HostRightToggle}"
                              GroupName="TopSections"
                              Content="&#xE8AE;"
                              ToolTip="Gestionnaire"
                              Click="OnManagerClick"
-                             IsChecked="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsManagerSelected, Mode=TwoWay}" />
+                             IsChecked="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsManagerSelected, Mode=TwoWay}"
+                             IsEnabled="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsManagerEnabled}"
+                             Visibility="{Binding RelativeSource={RelativeSource AncestorType={x:Type host:WpsHostTitleBar}}, Path=IsManagerVisible, Converter={StaticResource BoolToVisibilityConv}}" />
             </StackPanel>
         </wpsui:WpsTitleBar.LeftExtras>
         <!-- 2 boutons à droite (avant Min/Max/Close), pattern Word/Outlook :
              - Search (loupe E721) + Help (? E897) : Button simples, RoutedEvent pour câblage
-               caller. Placeholder (pas encore câblés à une fonctionnalité réelle). -->
+               caller. Placeholder (pas encore câblés à une fonctionnalité réelle) → grisés
+               via IsEnabled="False" pour signaler visuellement à l'utilisateur que ces boutons
+               existent mais ne sont pas encore actifs (opacité 0.4 + cursor Arrow via le
+               trigger IsEnabled=False du style HostRightBtn). À retirer quand le câblage
+               sera fait. -->
         <wpsui:WpsTitleBar.RightExtras>
             <StackPanel Orientation="Horizontal">
                 <Button Style="{StaticResource HostRightBtn}"
                         Content="&#xE721;"
-                        ToolTip="Rechercher"
+                        ToolTip="Rechercher (à venir)"
+                        IsEnabled="False"
                         Click="OnSearchClick" />
                 <Button Style="{StaticResource HostRightBtn}"
                         Content="&#xE897;"
-                        ToolTip="Aide"
+                        ToolTip="Aide (à venir)"
+                        IsEnabled="False"
                         Click="OnHelpClick" />
             </StackPanel>
         </wpsui:WpsTitleBar.RightExtras>

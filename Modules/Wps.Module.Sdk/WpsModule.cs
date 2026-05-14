@@ -274,6 +274,31 @@ public static class WpsModule
     }
 
     /// <summary>
+    /// (v1.4) Émet un signal métier générique vers le host. Fire-and-forget : pas d'ACK
+    /// attendu, le module enchaîne sa logique sans bloquer. Pattern d'usage typique : un
+    /// module qui démarre un serveur interne (HTTP, WebSocket, etc.) appelle ce hook après
+    /// que son listener soit actif, le host route alors le signal vers son UI pour activer
+    /// un bouton, afficher un état, etc.
+    /// <para>Exemple — wipiManager.Server signalant que son serveur interne wpsServices est
+    /// up :</para>
+    /// <code>
+    /// // dans WmServerService.OnServerReady(port)
+    /// _server.ServiceStartResponse(true);
+    /// _ = WpsModule.NotifySignalAsync("server-ready", port.ToString());
+    /// </code>
+    /// <para>Le <paramref name="name"/> ne doit pas contenir de <c>|</c> (séparateur de
+    /// champs du wire-protocol) ; le <paramref name="payload"/> peut en contenir (c'est la
+    /// dernière portion de la trame). Safe à appeler en standalone : retourne immédiatement
+    /// (no-op). Idempotence à la charge du module : si le signal "server-ready" est émis
+    /// plusieurs fois, le host le verra plusieurs fois.</para>
+    /// </summary>
+    public static Task NotifySignalAsync(string name, string payload = "")
+    {
+        if (!IsEmbedded || _connection is null) return Task.CompletedTask;
+        return _connection.SendSignalAsync(name, payload);
+    }
+
+    /// <summary>
     /// (v1.3) Résolution asynchrone d'un <see cref="IWpsModule.OnCanCloseRequestedAsync"/>
     /// retourné en Busy ou NeedUser. À appeler quand l'app a fini son Busy long ou quand
     /// l'utilisateur a tranché un dialog NeedUser.

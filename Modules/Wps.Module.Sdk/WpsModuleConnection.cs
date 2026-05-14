@@ -148,6 +148,13 @@ internal sealed class WpsModuleConnection : IDisposable
     public Task SendSelfClosingAsync(string reason) =>
         _duplex.SendAsync($"{WpsModuleContract.NotifSelfClosing}{WpsModuleContract.Separator}{reason ?? ""}");
 
+    /// <summary>(v1.4) Envoie un signal métier générique au host. Format
+    /// <c>SIGNAL|name|payload</c> — fire-and-forget, pas d'ACK attendu. Le <paramref name="name"/>
+    /// ne doit pas contenir de <c>|</c> (c'est la 2e portion de trame) ; le <paramref name="payload"/>
+    /// peut en contenir (dernière portion, reconstruite côté host via <c>Split(sep, 3)</c>).</summary>
+    public Task SendSignalAsync(string name, string payload) =>
+        _duplex.SendAsync($"{WpsModuleContract.NotifSignal}{WpsModuleContract.Separator}{name ?? ""}{WpsModuleContract.Separator}{payload ?? ""}");
+
     // ====== Dispatch des messages reçus du host ======
 
     private void Dispatch(string line)

@@ -231,6 +231,36 @@ public partial class WpsHostTitleBar : UserControl
         set => SetValue(IsManagerSelectedProperty, value);
     }
 
+    /// <summary>Active ou désactive le RadioButton "Gestionnaire". Default <c>true</c>.
+    /// Pattern : le caller peut le mettre à <c>false</c> au boot (icône grisée) puis le
+    /// rebasculer à <c>true</c> quand un événement externe le signale (ex : wipiManager.Server
+    /// pulse ssActive via wpsServices → le serveur interne est prêt, on active l'accès UI).
+    /// <para>Le style XAML <c>HostRightToggle</c> rend l'icône à 40% d'opacité + cursor Arrow
+    /// quand IsEnabled est false (cf. Trigger).</para></summary>
+    public static readonly DependencyProperty IsManagerEnabledProperty =
+        DependencyProperty.Register(nameof(IsManagerEnabled), typeof(bool), typeof(WpsHostTitleBar),
+            new PropertyMetadata(true));
+
+    public bool IsManagerEnabled
+    {
+        get => (bool)GetValue(IsManagerEnabledProperty);
+        set => SetValue(IsManagerEnabledProperty, value);
+    }
+
+    /// <summary>Affiche ou masque le RadioButton "Gestionnaire" (Visibility Visible/Collapsed).
+    /// Default <c>true</c>. Pattern : le caller le met à <c>false</c> quand le poste courant
+    /// n'a pas le rôle qui justifie l'accès à la section Gestionnaire (typiquement : poste
+    /// non-serveur ne montre pas le bouton de gestion du serveur).</summary>
+    public static readonly DependencyProperty IsManagerVisibleProperty =
+        DependencyProperty.Register(nameof(IsManagerVisible), typeof(bool), typeof(WpsHostTitleBar),
+            new PropertyMetadata(true));
+
+    public bool IsManagerVisible
+    {
+        get => (bool)GetValue(IsManagerVisibleProperty);
+        set => SetValue(IsManagerVisibleProperty, value);
+    }
+
     /// <summary>Event raised quand l'utilisateur clique le bouton Modules.</summary>
     public static readonly RoutedEvent ModulesClickEvent =
         EventManager.RegisterRoutedEvent(nameof(ModulesClick), RoutingStrategy.Bubble,

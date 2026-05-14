@@ -87,6 +87,12 @@ public sealed class WpsModuleSlot : IDisposable, IWpsShutdownTarget
     /// Permet au host de griser le slot proprement (état "Closed" plutôt que "Failed").</summary>
     public event Action<string>? SelfClosing;
 
+    /// <summary>(v1.4) Émis quand le module envoie un signal métier générique
+    /// (<c>SIGNAL|name|payload</c>). Arguments : <c>(name, payload)</c>. L'app host filtre
+    /// par <paramref name="name"/> pour router vers la logique métier (typiquement : activer
+    /// un bouton UI quand <c>name == "server-ready"</c> pour wipiManager.Server).</summary>
+    public event Action<string, string>? SignalReceived;
+
     /// <summary>(v1.3) Émis si le process meurt pendant la séquence (alias plus sémantique de
     /// <see cref="ProcessExited"/> pour les callers de <see cref="IWpsShutdownTarget"/>).</summary>
     event Action? IWpsShutdownTarget.Disconnected
@@ -142,6 +148,11 @@ public sealed class WpsModuleSlot : IDisposable, IWpsShutdownTarget
             BusyProgressChanged?.Invoke(new HostBusyProgress(percent, msg));
         _connection.CanCloseNeedUser += payload =>
             NeedUserSignaled?.Invoke(payload);
+
+        // (v1.4) Republie les SIGNAL Module → Host vers l'event public du slot. Permet à
+        // l'app host de filtrer par nom (ex: "server-ready") sans connaître la connexion.
+        _connection.SignalReceived += (name, payload) =>
+            SignalReceived?.Invoke(name, payload);
         _connection.SelfClosing += reason =>
             SelfClosing?.Invoke(reason);
 
