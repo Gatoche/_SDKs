@@ -36,8 +36,10 @@
     <!-- Nom court de l'app (default = nom du projet, override via <WipiModuleName>) -->
     <WipiModuleName Condition="'$(WipiModuleName)' == ''">$(MSBuildProjectName)</WipiModuleName>
 
-    <!-- Chemin de déploiement final pour CETTE app -->
-    <WipiModuleDeployPath>$(WipiModulesDeployDir)\$(WipiModuleName)</WipiModuleDeployPath>
+    <!-- Chemin de déploiement final pour CETTE app. Overridable par le csproj
+         pour les cas spéciaux (ex: wipiManager.Server qui doit aller dans
+         C:\_wipiSoft\wipiManager\Server\ — racine wipiManager, pas Apps\Modules\). -->
+    <WipiModuleDeployPath Condition="'$(WipiModuleDeployPath)' == ''">$(WipiModulesDeployDir)\$(WipiModuleName)</WipiModuleDeployPath>
   </PropertyGroup>
 
   <!--
